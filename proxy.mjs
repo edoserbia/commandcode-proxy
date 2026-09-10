@@ -20,6 +20,7 @@ function loadConfig() {
     projectSlug: 'cc-proxy',
     logFile: '',
     logLevel: 'info',
+    apiKeyFile: '',
     useProviderModels: true,
     modelRefreshIntervalMs: 5 * 60 * 1000,  // 5 minutes
     zdr: false,
@@ -42,6 +43,7 @@ function loadConfig() {
   if (process.env.CC_API_BASE) defaults.apiBase = process.env.CC_API_BASE;
   if (process.env.PROJECT_SLUG) defaults.projectSlug = process.env.PROJECT_SLUG;
   if (process.env.LOG_FILE) defaults.logFile = process.env.LOG_FILE;
+  if (process.env.CC_API_KEY_FILE) defaults.apiKeyFile = process.env.CC_API_KEY_FILE;
   if (process.env.CC_USE_PROVIDER_MODELS) defaults.useProviderModels = process.env.CC_USE_PROVIDER_MODELS !== 'false';
   if (process.env.CMD_ZDR !== undefined) defaults.zdr = process.env.CMD_ZDR === '1';
   if (process.env.CC_EMPTY_SYSTEM_PLACEHOLDER) defaults.emptySystemPlaceholder = process.env.CC_EMPTY_SYSTEM_PLACEHOLDER !== 'false';
@@ -197,6 +199,7 @@ setInterval(() => {
     if (now >= entry.expiresAt) {
       sessionStore.delete(key);
       keyStateStore.delete(key); // 同时清理该 key 的指纹状态
+      modelCache.delete(key); // 同时清理该 key 的模型缓存
       cleaned++;
     }
   }
@@ -296,46 +299,6 @@ async function ensureInitialized(apiKey, signal) {
     if (e.name !== 'AbortError') log('warn', 'Fingerprint/lifecycle refresh error, will retry next request', { error: e.message });
   }
 }
-
-// ── 模型列表 ───────────────────────────────────────
-const MODELS = [
-  // Anthropic
-  { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6' },
-  { id: 'claude-opus-4-8', name: 'Claude Opus 4.8' },
-  { id: 'claude-opus-4-7', name: 'Claude Opus 4.7' },
-  { id: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5' },
-  // OpenAI
-  { id: 'gpt-5.5', name: 'GPT-5.5' },
-  { id: 'gpt-5.4', name: 'GPT-5.4' },
-  { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini' },
-  { id: 'gpt-5.3-codex', name: 'GPT-5.3 Codex' },
-  // DeepSeek
-  { id: 'deepseek/deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
-  { id: 'deepseek/deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
-  // Kimi
-  { id: 'moonshotai/Kimi-K2.6', name: 'Kimi K2.6' },
-  { id: 'moonshotai/Kimi-K2.5', name: 'Kimi K2.5' },
-  // GLM
-  { id: 'zai-org/GLM-5.1', name: 'GLM 5.1' },
-  { id: 'zai-org/GLM-5', name: 'GLM 5' },
-  // MiniMax
-  { id: 'MiniMaxAI/MiniMax-M3', name: 'MiniMax M3' },
-  { id: 'MiniMaxAI/MiniMax-M2.7', name: 'MiniMax M2.7' },
-  { id: 'MiniMaxAI/MiniMax-M2.5', name: 'MiniMax M2.5' },
-  // Qwen
-  { id: 'Qwen/Qwen3.6-Max-Preview', name: 'Qwen 3.6 Max Preview' },
-  { id: 'Qwen/Qwen3.6-Plus', name: 'Qwen 3.6 Plus' },
-  { id: 'Qwen/Qwen3.7-Max', name: 'Qwen 3.7 Max' },
-  // Step
-  { id: 'stepfun/Step-3.7-Flash', name: 'Step 3.7 Flash' },
-  { id: 'stepfun/Step-3.5-Flash', name: 'Step 3.5 Flash' },
-  // Xiaomi
-  { id: 'xiaomi/mimo-v2.5-pro', name: 'MiMo V2.5 Pro' },
-  { id: 'xiaomi/mimo-v2.5', name: 'MiMo V2.5' },
-  // Gemini
-  { id: 'google/gemini-3.5-flash', name: 'Gemini 3.5 Flash' },
-  { id: 'google/gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite' },
-];
 
 // ── 工具函数 ───────────────────────────────────────
 
@@ -497,7 +460,7 @@ function buildCcRequest(openaiReq) {
     skills: '',
     permissionMode: 'standard',
     params: {
-      model: model || 'deepseek/deepseek-v4-flash',
+      model: model || 'deepseek/deepseek-v4.1-flash',
       messages: ccMessages,
       max_tokens: Math.min(max_tokens || 64000, 200000),
       stream: true,  // CC API 总是 stream
@@ -819,20 +782,43 @@ function sendJSON(res, status, data) {
   res.end(JSON.stringify(data));
 }
 
-function getApiKey(headers) {
+function getApiKey(headers, allowConfigured = false) {
+  const configuredApiKey = allowConfigured ? getConfiguredApiKey() : null;
   // Try Authorization: Bearer header (OpenAI SDK style)
   const auth = headers['authorization'] || headers['Authorization'] || '';
   if (auth.startsWith('Bearer ')) {
     const match = auth.slice(7).match(/user_[a-zA-Z0-9_-]+/);
     if (match) return match[0];
+    if (auth.slice(7).trim() === 'PROXY_MANAGED' && configuredApiKey) return configuredApiKey;
   }
   // Fall back to x-api-key header (Anthropic SDK style)
   const xKey = headers['x-api-key'] || headers['X-Api-Key'] || '';
   if (xKey) {
     const match = xKey.match(/user_[a-zA-Z0-9_-]+/);
     if (match) return match[0];
+    if (xKey.trim() === 'PROXY_MANAGED' && configuredApiKey) return configuredApiKey;
   }
-  return null;
+  return configuredApiKey;
+}
+
+function isLoopbackRequest(req) {
+  const address = req.socket?.remoteAddress || '';
+  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
+}
+
+// 允许本机客户端使用一个不含真实密钥的 PROXY_MANAGED 标记；真实账号密钥
+// 从受保护的本机凭据文件读取，不进入仓库、客户端配置或日志。
+function getConfiguredApiKey() {
+  if (CFG.apiKey && typeof CFG.apiKey === 'string') return CFG.apiKey.trim() || null;
+  if (!CFG.apiKeyFile || !existsSync(CFG.apiKeyFile)) return null;
+  try {
+    const contents = readFileSync(CFG.apiKeyFile, 'utf-8');
+    const match = contents.match(/^\s*CC_DEEPSEEK_API_KEY:\s*([^\s#]+)\s*$/m);
+    return match?.[1] || null;
+  } catch (e) {
+    log('warn', 'Configured API key file could not be read', { error: e.message });
+    return null;
+  }
 }
 
 // ── 流式转发 ────────────────────────────────────────
@@ -883,14 +869,14 @@ async function handleChatCompletions(req, res) {
     return;
   }
 
-  const apiKey = getApiKey(req.headers);
+  const apiKey = getApiKey(req.headers, isLoopbackRequest(req));
   if (!apiKey) {
     sendJSON(res, 401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header', type: 'auth_error' } });
     return;
   }
 
   const stream = openaiReq.stream === true;
-  const model = openaiReq.model || 'deepseek/deepseek-v4-flash';
+  const model = openaiReq.model || 'deepseek/deepseek-v4.1-flash';
   const completionId = `chatcmpl-${randomUUID().slice(0, 12)}`;
   const created = nowUnix();
 
@@ -1373,7 +1359,7 @@ function convertAnthropicToOpenAI(anthropicReq) {
 
   // 3. Build OpenAI request
   const openaiReq = {
-    model: anthropicReq.model || 'deepseek/deepseek-v4-flash',
+    model: anthropicReq.model || 'deepseek/deepseek-v4.1-flash',
     messages: openaiMessages,
     max_tokens: anthropicReq.max_tokens || 64000,
     stream: anthropicReq.stream === true,
@@ -1661,14 +1647,14 @@ async function handleMessages(req, res) {
     return;
   }
 
-  const apiKey = getApiKey(req.headers);
+  const apiKey = getApiKey(req.headers, isLoopbackRequest(req));
   if (!apiKey) {
     sendJSON(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header' } });
     return;
   }
 
   const stream = anthropicReq.stream === true;
-  const model = anthropicReq.model || 'claude-sonnet-4-6';
+  const model = anthropicReq.model || 'deepseek/deepseek-v4.1-flash';
 
   // Convert Anthropic → OpenAI → CC
   const openaiReq = convertAnthropicToOpenAI(anthropicReq);
@@ -1970,19 +1956,32 @@ async function handleMessages(req, res) {
 
 // ── 动态模型列表 ────────────────────────────────────
 
-let dynamicModels = null;
-let modelsLastFetch = 0;
+// 模型权限属于 API Key，不能使用全局缓存，否则一个账号可能看到另一个账号的模型。
+const modelCache = new Map(); // apiKey → { models, fetchedAt }
+
+class ModelsUpstreamError extends Error {
+  constructor(message, status = 502) {
+    super(message);
+    this.name = 'ModelsUpstreamError';
+    this.status = status;
+  }
+}
 
 async function fetchModels(apiKey) {
-  const now = Date.now();
-  if (dynamicModels && (now - modelsLastFetch) < CFG.modelRefreshIntervalMs) {
-    return dynamicModels;
+  if (!apiKey) throw new ModelsUpstreamError('Missing API key. Send it in Authorization: Bearer <key> or x-api-key header', 401);
+  if (!CFG.useProviderModels) {
+    throw new ModelsUpstreamError('Provider model discovery is disabled', 503);
   }
 
-  try {
-    if (!apiKey || !CFG.useProviderModels) throw new Error('Provider models disabled');
+  const now = Date.now();
+  const cached = modelCache.get(apiKey);
+  if (cached && (now - cached.fetchedAt) < CFG.modelRefreshIntervalMs) {
+    return cached.models;
+  }
 
-    const response = await fetch(`${CFG.apiBase}/provider/v1/models`, {
+  let response;
+  try {
+    response = await fetch(`${CFG.apiBase}/provider/v1/models`, {
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'x-cli-environment': 'production',
@@ -1990,41 +1989,57 @@ async function fetchModels(apiKey) {
       },
       signal: AbortSignal.timeout(10000),
     });
-
-    if (response.ok) {
-      const data = await response.json();
-      if (Array.isArray(data.data)) {
-        dynamicModels = data.data.map(m => ({
-          id: m.id,
-          name: m.id,
-        }));
-        modelsLastFetch = now;
-        log('info', 'Fetched models from Provider API', { count: dynamicModels.length });
-        return dynamicModels;
-      }
-    }
-    log('warn', 'Provider models fetch failed, using hardcoded list', { status: response.status });
   } catch (e) {
-    log('warn', 'Provider models fetch error, using hardcoded list', { error: e.message });
+    log('warn', 'Provider models fetch error', { error: e.message });
+    throw new ModelsUpstreamError(`Unable to fetch models from Command Code: ${e.message}`, 503);
   }
 
-  // Fallback to hardcoded MODELS
-  return MODELS;
+  let data;
+  try {
+    data = await response.json();
+  } catch {
+    data = null;
+  }
+
+  if (!response.ok) {
+    const message = data?.error?.message || data?.message || `Provider models endpoint returned ${response.status}`;
+    log('warn', 'Provider models fetch failed', { status: response.status });
+    throw new ModelsUpstreamError(message, response.status === 401 || response.status === 403 ? 401 : 502);
+  }
+
+  if (!Array.isArray(data?.data)) {
+    log('warn', 'Provider models response has invalid shape');
+    throw new ModelsUpstreamError('Provider models endpoint returned an invalid model list', 502);
+  }
+
+  const models = data.data
+    .filter(model => model && typeof model.id === 'string' && model.id.length > 0)
+    .map(model => ({
+      ...model,
+      id: model.id,
+      object: model.object || 'model',
+      owned_by: model.owned_by || 'command-code',
+    }));
+
+  modelCache.set(apiKey, { models, fetchedAt: now });
+  log('info', 'Fetched models from Provider API', { count: models.length });
+  return models;
 }
 
 async function handleModels(req, res) {
-  const apiKey = getApiKey(req.headers);
-  const models = await fetchModels(apiKey);
-  const now = nowUnix();
-  sendJSON(res, 200, {
-    object: 'list',
-    data: models.map(m => ({
-      id: m.id,
-      object: 'model',
-      created: now,
-      owned_by: 'command-code',
-    })),
-  });
+  const apiKey = getApiKey(req.headers, isLoopbackRequest(req));
+  try {
+    const models = await fetchModels(apiKey);
+    sendJSON(res, 200, { object: 'list', data: models });
+  } catch (e) {
+    const status = e instanceof ModelsUpstreamError ? e.status : 502;
+    sendJSON(res, status, {
+      error: {
+        message: e.message || 'Unable to fetch available models',
+        type: status === 401 ? 'authentication_error' : 'upstream_error',
+      },
+    });
+  }
 }
 
 function handleHealth(req, res) {
@@ -2079,7 +2094,7 @@ server.listen(CFG.port, CFG.host, () => {
   log('info', 'CC Proxy started', {
     url: `http://${CFG.host}:${CFG.port}`,
     api: CFG.apiBase,
-    models: MODELS.length,
+    models: 'dynamic per API key',
     session: '12h + 1h jitter, per API key',
     zdr: CFG.zdr ? 'enabled (x-cmd-zdr: 1 on generation/init requests)' : 'off (CMD_ZDR=1 or per-request x-cmd-zdr: 1 to enable)',
     emptySystemPlaceholder: CFG.emptySystemPlaceholder ? 'on (space placeholder for requests without system prompt, issue #17)' : 'off',

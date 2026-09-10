@@ -58,6 +58,7 @@ commandcode/
 | `apiKey` | `""` | Optional fallback API key (requests can also send it via header) |
 | `logFile` | `""` | Log file path (empty = console only) |
 | `logLevel` | `info` | Log level |
+| `apiKeyFile` | `""` | Optional local credential file; reads `CC_DEEPSEEK_API_KEY` for loopback clients using `PROXY_MANAGED` |
 | `useProviderModels` | `true` | Dynamically fetch model list from Provider API |
 | `modelRefreshIntervalMs` | `300000` | Model list cache refresh interval (5 min) |
 | `zdr` | `false` | Request ZDR-only routing from Command Code |
@@ -246,7 +247,7 @@ data: {"type":"message_stop"}
 
 ### `GET /v1/models`
 
-Returns available model list. Fetched dynamically from Provider API (5 min cache), falls back to hardcoded list on failure.
+Returns only the models returned by the upstream Provider API for the request's API key (5 min per-key cache). The proxy does not fall back to a hardcoded list; if the account cannot be queried, the endpoint returns an authentication/upstream error instead of advertising models that may not be callable.
 
 ### `GET /health`
 
@@ -362,7 +363,7 @@ Based on analysis of official CLI traffic (version auto-fetched from npm registr
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
 | **Environment** | `x-cli-environment: production`, `x-co-flag: "false"`, `x-taste-learning: "false"` |
 | **Project Slug** | `x-project-slug` generated from session ID (CLI-compatible format) |
-| **Reasoning Effort** | `reasoning_effort` pass-through (low/medium/high/max) |
+| **Reasoning Effort** | `reasoning_effort` pass-through (off/minimal/low/medium/high/xhigh/max) |
 | **Key Validation** | Regex `user_[a-zA-Z0-9_-]+` on `Authorization: Bearer` or `x-api-key`, auto-cleans extra paths/prefixes, rejects `sk-xxx` format |
 | **Stream Timeout** | 30s streaming / 90s non-streaming → 429 with SDK auto-retry |
 | **Consecutive Timeout** | 3 consecutive timeouts before "reduce context" hint |

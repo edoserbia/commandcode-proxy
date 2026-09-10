@@ -58,6 +58,7 @@ commandcode/
 | `apiKey` | `""` | 可选兜底 API Key（请求也可通过 header 传入） |
 | `logFile` | `""` | 日志文件路径（空=仅控制台） |
 | `logLevel` | `info` | 日志级别 |
+| `apiKeyFile` | `""` | 可选本机凭据文件；本机客户端使用 `PROXY_MANAGED` 时读取其中的 `CC_DEEPSEEK_API_KEY` |
 | `useProviderModels` | `true` | 从 Provider API 动态拉取模型列表 |
 | `modelRefreshIntervalMs` | `300000` | 模型列表缓存刷新间隔（5min） |
 | `zdr` | `false` | 请求 Command Code 使用 ZDR-only 路由 |
@@ -244,7 +245,7 @@ data: {"type":"message_stop"}
 
 ### `GET /v1/models`
 
-返回可用模型列表。优先从 Provider API 动态拉取（5min 缓存），失败回退硬编码列表。
+返回当前 API Key 对应账号由上游 Provider API 实际返回的模型（按 Key 缓存 5min）。代理不会回退到硬编码列表；账号无法查询时返回鉴权/上游错误，避免展示无法调用的模型。
 
 ### `GET /health`
 
@@ -360,7 +361,7 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
 | **环境标识** | `x-cli-environment: production`、`x-co-flag: "false"`、`x-taste-learning: "false"` |
 | **Project Slug** | 从 sessionId 生成的 `x-project-slug`（与真实 CLI 格式一致） |
-| **思考强度** | `reasoning_effort` 透传 (low/medium/high/max) |
+| **思考强度** | `reasoning_effort` 透传 (off/minimal/low/medium/high/xhigh/max) |
 | **API Key 格式验证** | 对 `Authorization: Bearer` 或 `x-api-key` 用正则 `user_[a-zA-Z0-9_-]+` 提取，自动清理多余路径/前缀，`sk-xxx` 等非 `user_` 格式拒 |
 | **流式超时保护** | 流式 30s、非流式 90s → 429 + SDK 自动重试 |
 | **连续超时阈值** | 连续 3 次超时后才提示压缩上下文 |
