@@ -5,7 +5,7 @@
 import http from 'http';
 import crypto from 'crypto';
 import { randomUUID } from 'crypto';
-import { readFileSync, existsSync, appendFileSync } from 'fs';
+import { readFileSync, existsSync, appendFileSync, writeFileSync, renameSync, unlinkSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -25,6 +25,13 @@ function loadConfig() {
     modelRefreshIntervalMs: 5 * 60 * 1000,  // 5 minutes
     zdr: false,
     emptySystemPlaceholder: true, // 无 system prompt 时发空格占位，阻止 CC 上游注入 ~7.5K token 默认提示词（issue #17）
+    // ── 多账号密钥池 + 熔断 ──
+    apiKeys: [],                  // 有序账号密钥列表；留空则回退到 apiKey / apiKeyFile
+    keyFailover: true,            // 是否在账号之间自动故障转移
+    keyCooldownMs: 7 * 24 * 60 * 60 * 1000, // 长冷却 1 周：额度耗尽 / 鉴权失败
+    keyShortCooldownMs: 60 * 1000,          // 短冷却 60s：限流 / 5xx / 网络错误
+    keyStateFile: '',             // 熔断状态落盘路径；留空则用 <proxy 目录>/.key-health.json
+    maxKeyAttempts: 0,            // 单次请求最多尝试几个账号；0 = 不限（最多试完全部候选）
   };
 
   const configPath = resolve(__dirname, 'config.json');
@@ -48,10 +55,44 @@ function loadConfig() {
   if (process.env.CMD_ZDR !== undefined) defaults.zdr = process.env.CMD_ZDR === '1';
   if (process.env.CC_EMPTY_SYSTEM_PLACEHOLDER) defaults.emptySystemPlaceholder = process.env.CC_EMPTY_SYSTEM_PLACEHOLDER !== 'false';
 
+  // 密钥池：CC_API_KEYS 支持逗号/空白分隔的有序列表
+  if (process.env.CC_API_KEYS) {
+    defaults.apiKeys = process.env.CC_API_KEYS.split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
+  }
+  if (process.env.CC_KEY_FAILOVER !== undefined) defaults.keyFailover = process.env.CC_KEY_FAILOVER !== 'false';
+  if (process.env.CC_KEY_COOLDOWN_MS) {
+    const ms = Number.parseInt(process.env.CC_KEY_COOLDOWN_MS, 10);
+    if (Number.isFinite(ms) && ms >= 0) defaults.keyCooldownMs = ms;
+  }
+  if (process.env.CC_KEY_SHORT_COOLDOWN_MS) {
+    const ms = Number.parseInt(process.env.CC_KEY_SHORT_COOLDOWN_MS, 10);
+    if (Number.isFinite(ms) && ms >= 0) defaults.keyShortCooldownMs = ms;
+  }
+  if (process.env.CC_KEY_STATE_FILE) defaults.keyStateFile = process.env.CC_KEY_STATE_FILE;
+  if (process.env.CC_MAX_KEY_ATTEMPTS) {
+    const n = Number.parseInt(process.env.CC_MAX_KEY_ATTEMPTS, 10);
+    if (Number.isFinite(n) && n >= 0) defaults.maxKeyAttempts = n;
+  }
+
   return defaults;
 }
 
 const CFG = loadConfig();
+
+// 配置归一化：apiKeys 必须是「非空字符串」组成的有序数组，其余数值项必须是正数，
+// 否则坏配置会让熔断逻辑静默失效（例如把冷却设成 0 就等于永不熔断）。
+if (!Array.isArray(CFG.apiKeys)) {
+  console.error('[config] apiKeys must be an array of strings; ignoring value');
+  CFG.apiKeys = [];
+}
+CFG.apiKeys = CFG.apiKeys.filter(k => typeof k === 'string' && k.trim()).map(k => k.trim());
+for (const field of ['keyCooldownMs', 'keyShortCooldownMs', 'maxKeyAttempts']) {
+  const n = CFG[field];
+  if (typeof n !== 'number' || !Number.isFinite(n) || n < 0) {
+    console.error(`[config] ${field} must be a number >= 0; falling back to default`);
+    CFG[field] = field === 'maxKeyAttempts' ? 0 : (field === 'keyCooldownMs' ? 7 * 24 * 60 * 60 * 1000 : 60 * 1000);
+  }
+}
 
 // ── 指纹生成（首次运行自动生成，写回 config.json） ──────
 // CPU 型号与核心数对应表（仅 Windows x64）
@@ -868,22 +909,7 @@ function sendJSON(res, status, data) {
 }
 
 function getApiKey(headers, allowConfigured = false) {
-  const configuredApiKey = allowConfigured ? getConfiguredApiKey() : null;
-  // Try Authorization: Bearer header (OpenAI SDK style)
-  const auth = headers['authorization'] || headers['Authorization'] || '';
-  if (auth.startsWith('Bearer ')) {
-    const match = auth.slice(7).match(/user_[a-zA-Z0-9_-]+/);
-    if (match) return match[0];
-    if (auth.slice(7).trim() === 'PROXY_MANAGED' && configuredApiKey) return configuredApiKey;
-  }
-  // Fall back to x-api-key header (Anthropic SDK style)
-  const xKey = headers['x-api-key'] || headers['X-Api-Key'] || '';
-  if (xKey) {
-    const match = xKey.match(/user_[a-zA-Z0-9_-]+/);
-    if (match) return match[0];
-    if (xKey.trim() === 'PROXY_MANAGED' && configuredApiKey) return configuredApiKey;
-  }
-  return configuredApiKey;
+  return resolveKeyCandidates(headers, allowConfigured).keys[0] || null;
 }
 
 function isLoopbackRequest(req) {
@@ -891,19 +917,240 @@ function isLoopbackRequest(req) {
   return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
 }
 
-// 允许本机客户端使用一个不含真实密钥的 PROXY_MANAGED 标记；真实账号密钥
-// 从受保护的本机凭据文件读取，不进入仓库、客户端配置或日志。
-function getConfiguredApiKey() {
-  if (CFG.apiKey && typeof CFG.apiKey === 'string') return CFG.apiKey.trim() || null;
-  if (!CFG.apiKeyFile || !existsSync(CFG.apiKeyFile)) return null;
+// ── 多账号密钥池 + 熔断（circuit breaker）───────────────
+//
+// 目标：配置多个 Command Code 账号密钥，按顺序使用；某个账号额度耗尽 / 鉴权失败 /
+// 连续报错时立刻熔断并自动切换到下一个，无需人工干预。
+//
+// 熔断分两档（可在 config.json 调）：
+//   · 长冷却 keyCooldownMs（默认 1 周）—— 额度耗尽（402）、鉴权失败（401/403）、
+//     以及文案明确指向配额/余额的 429。这类问题短期内不会自行恢复，等一周即可
+//     覆盖「每周限额」的重置周期。
+//   · 短冷却 keyShortCooldownMs（默认 60s）—— 普通限流 429、5xx、网络错误。
+//     这类问题稍后重试就能成功，不该把账号封一周。
+//
+// 熔断状态只以 sha256 指纹（前 16 位十六进制）为键落盘，不写入明文密钥。
+
+const KEY_QUOTA_HINT = /quota|exceed|insufficient|balance|credit|payment|limit reached|usage limit|额度|余额|超出|限额|用尽|耗尽/i;
+
+function keyFingerprint(apiKey) {
+  return crypto.createHash('sha256').update(String(apiKey)).digest('hex').slice(0, 16);
+}
+
+// 日志里只出现指纹/短前缀，绝不出现完整密钥
+function keyLabel(apiKey) {
+  const s = String(apiKey);
+  return `${s.slice(0, 8)}…#${keyFingerprint(apiKey).slice(0, 6)}`;
+}
+
+const keyBreaker = new Map(); // fingerprint → { until, kind, status, message, openedAt }
+
+function keyStatePath() {
+  return CFG.keyStateFile || resolve(__dirname, '.key-health.json');
+}
+
+function loadKeyBreakerState() {
+  const path = keyStatePath();
+  if (!existsSync(path)) return;
   try {
-    const contents = readFileSync(CFG.apiKeyFile, 'utf-8');
-    const match = contents.match(/^\s*CC_DEEPSEEK_API_KEY:\s*([^\s#]+)\s*$/m);
-    return match?.[1] || null;
+    const data = JSON.parse(readFileSync(path, 'utf-8'));
+    const now = Date.now();
+    let loaded = 0;
+    for (const [fp, entry] of Object.entries(data?.breakers || {})) {
+      if (!entry || typeof entry.until !== 'number' || entry.until <= now) continue; // 已过期，不必恢复
+      keyBreaker.set(fp, {
+        until: entry.until,
+        kind: entry.kind || 'unknown',
+        status: entry.status ?? 0,
+        message: typeof entry.message === 'string' ? entry.message.slice(0, 200) : '',
+        openedAt: entry.openedAt || now,
+      });
+      loaded++;
+    }
+    if (loaded) log('info', 'Restored key breaker state', { cooling: loaded, path });
+  } catch (e) {
+    log('warn', 'Key breaker state could not be read; starting fresh', { error: e.message });
+  }
+}
+
+let keyPersistTimer = null;
+function persistKeyBreakerState() {
+  // 合并短时间内的多次写入，避免每个失败请求都碰一次磁盘
+  if (keyPersistTimer) return;
+  keyPersistTimer = setTimeout(() => {
+    keyPersistTimer = null;
+    const path = keyStatePath();
+    const tmp = `${path}.tmp-${process.pid}`;
+    try {
+      const breakers = {};
+      for (const [fp, entry] of keyBreaker.entries()) {
+        breakers[fp] = {
+          until: entry.until, kind: entry.kind, status: entry.status,
+          message: entry.message, openedAt: entry.openedAt,
+        };
+      }
+      writeFileSync(tmp, JSON.stringify({ version: 1, savedAt: Date.now(), breakers }, null, 2), 'utf-8');
+      renameSync(tmp, path); // 原子替换，避免半截文件
+    } catch (e) {
+      try { if (existsSync(tmp)) unlinkSync(tmp); } catch {}
+      log('warn', 'Key breaker state could not be written', { error: e.message });
+    }
+  }, 250);
+  if (keyPersistTimer.unref) keyPersistTimer.unref();
+}
+
+function keyCooldownFor(kind) {
+  // 额度/鉴权属于「短期内不会自愈」，用长冷却；其余用短冷却
+  return (kind === 'quota' || kind === 'auth') ? CFG.keyCooldownMs : CFG.keyShortCooldownMs;
+}
+
+// 把上游失败归类，决定冷却时长；同时决定这次失败是否值得换账号重试
+function classifyUpstreamFailure(status, message) {
+  if (status === 401 || status === 403) return 'auth';
+  if (status === 402) return 'quota';
+  if (status === 429) return KEY_QUOTA_HINT.test(message || '') ? 'quota' : 'rate';
+  if (status >= 500) return 'server';
+  if (!status) return 'network';
+  return 'other';
+}
+
+// 只有「换账号可能成功」的错误才做故障转移。400/404/422 是请求本身的问题，
+// 换账号只会浪费一次调用并让报错信息变模糊。
+function isFailoverWorthy(status) {
+  return status === 401 || status === 403 || status === 402 || status === 429 || status >= 500;
+}
+
+function openKeyBreaker(apiKey, { kind, status, message }) {
+  const cooldownMs = keyCooldownFor(kind);
+  if (!(cooldownMs > 0)) return; // 冷却为 0 表示只转移、不记忆
+  const fp = keyFingerprint(apiKey);
+  const previous = keyBreaker.get(fp);
+  keyBreaker.set(fp, {
+    until: Date.now() + cooldownMs,
+    kind,
+    status,
+    message: (message || '').slice(0, 200),
+    openedAt: Date.now(),
+  });
+  log('warn', previous ? 'Key cooldown extended' : 'Key circuit opened', {
+    key: keyLabel(apiKey),
+    kind,
+    status,
+    cooldownMs,
+    cooldownHuman: cooldownMs >= 3600000 ? `${(cooldownMs / 3600000).toFixed(1)}h` : `${(cooldownMs / 1000).toFixed(0)}s`,
+    message: (message || '').slice(0, 160),
+  });
+  persistKeyBreakerState();
+}
+
+function closeKeyBreaker(apiKey) {
+  const fp = keyFingerprint(apiKey);
+  if (keyBreaker.delete(fp)) {
+    log('info', 'Key circuit closed after success', { key: keyLabel(apiKey) });
+    persistKeyBreakerState();
+  }
+}
+
+function keyCoolingRemainingMs(apiKey, now = Date.now()) {
+  const entry = keyBreaker.get(keyFingerprint(apiKey));
+  if (!entry) return 0;
+  return Math.max(0, entry.until - now);
+}
+
+// 健康账号按配置顺序排在前面；已熔断的账号降级排在最后，
+// 仅在健康账号全部失败时才会被当作「half-open 探针」试用 —— 这样既避免
+// 反复撞已知失败的账号，又不会在所有账号都熔断时彻底锁死。
+function orderKeysByHealth(keys) {
+  const now = Date.now();
+  const healthy = [];
+  const cooling = [];
+  for (const k of keys) {
+    const remaining = keyCoolingRemainingMs(k, now);
+    if (remaining > 0) cooling.push({ key: k, until: now + remaining });
+    else healthy.push(k);
+  }
+  cooling.sort((a, b) => a.until - b.until); // 最先解冻的优先
+  return [...healthy, ...cooling.map(c => c.key)];
+}
+
+// 从凭据文件里读取全部密钥：支持 CC_DEEPSEEK_API_KEY、CC_DEEPSEEK_API_KEY_2、_3 …
+function readKeysFromFile(path) {
+  if (!path || !existsSync(path)) return [];
+  try {
+    const contents = readFileSync(path, 'utf-8');
+    const found = new Map(); // 序号 → 密钥，保证 _2 排在 _10 前面而不是字典序
+    const re = /^\s*CC_DEEPSEEK_API_KEY(?:_(\d+))?:\s*([^\s#]+)\s*$/gm;
+    let m;
+    while ((m = re.exec(contents)) !== null) {
+      const idx = m[1] ? Number.parseInt(m[1], 10) : 1;
+      const value = (m[2] || '').trim();
+      if (value && !found.has(idx)) found.set(idx, value);
+    }
+    return [...found.entries()].sort((a, b) => a[0] - b[0]).map(e => e[1]);
   } catch (e) {
     log('warn', 'Configured API key file could not be read', { error: e.message });
-    return null;
+    return [];
   }
+}
+
+// 有序密钥池：apiKeys（数组）优先，其次 apiKey（单个），最后 apiKeyFile（可含多个）
+function getConfiguredApiKeys() {
+  const pool = [];
+  const push = (k) => {
+    if (typeof k !== 'string') return;
+    const v = k.trim();
+    if (v && !pool.includes(v)) pool.push(v); // 去重：同一个账号写两遍没有意义
+  };
+
+  if (Array.isArray(CFG.apiKeys) && CFG.apiKeys.length) {
+    for (const k of CFG.apiKeys) push(k);
+  } else {
+    push(CFG.apiKey);
+    for (const k of readKeysFromFile(CFG.apiKeyFile)) push(k);
+  }
+  return pool;
+}
+
+// 向后兼容：旧调用点仍可用单值形式
+function getConfiguredApiKey() {
+  return getConfiguredApiKeys()[0] || null;
+}
+
+// 解析一次请求可用的账号候选（有序）。
+// 客户端自带真实账号密钥时只用它 —— 跨账号消耗别的账号额度属于意外行为。
+function resolveKeyCandidates(headers, allowConfigured = false) {
+  const explicit = (() => {
+    const auth = headers['authorization'] || headers['Authorization'] || '';
+    if (auth.startsWith('Bearer ')) {
+      const m = auth.slice(7).match(/user_[a-zA-Z0-9_-]+/);
+      if (m) return m[0];
+    }
+    const xKey = headers['x-api-key'] || headers['X-Api-Key'] || '';
+    if (xKey) {
+      const m = xKey.match(/user_[a-zA-Z0-9_-]+/);
+      if (m) return m[0];
+    }
+    return null;
+  })();
+
+  if (explicit) return { keys: [explicit], source: 'client' };
+
+  // PROXY_MANAGED 标记（或本机免密钥）→ 使用配置的账号池
+  if (!allowConfigured) return { keys: [], source: 'none' };
+  const pool = getConfiguredApiKeys();
+  if (!pool.length) return { keys: [], source: 'none' };
+  if (!CFG.keyFailover) return { keys: [pool[0]], source: 'configured-single' };
+  return { keys: orderKeysByHealth(pool), source: 'configured' };
+}
+
+// 取「下一个还没试过的账号」用于请求中途（尚未写出任何字节时）的重新尝试。
+// 返回 null 表示没有可用的下一个账号了。
+function nextKeyCandidate(candidates, triedKeys) {
+  if (!CFG.keyFailover) return null;
+  const limit = CFG.maxKeyAttempts > 0 ? CFG.maxKeyAttempts : Infinity;
+  if (triedKeys.length >= limit) return null;
+  const tried = new Set(triedKeys);
+  return candidates.find(k => !tried.has(k)) || null;
 }
 
 // ── 流式转发 ────────────────────────────────────────
@@ -939,6 +1186,93 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCac
   return response;
 }
 
+// 按账号候选依次尝试，直到拿到一个可用的上游响应。
+// 返回 { response, apiKey } 或 { error: {status, body}, apiKey, attempts }。
+// 只在这里做「拿响应」阶段的转移 —— 此时还没有任何字节写回客户端，切换账号
+// 对下游完全透明。
+async function forwardToCCWithFailover({ body, candidates, incomingHeaders, signal, promptCacheKey, path, model }) {
+  const limit = CFG.maxKeyAttempts > 0 ? Math.min(CFG.maxKeyAttempts, candidates.length) : candidates.length;
+  let last = null;
+
+  for (let i = 0; i < limit; i++) {
+    const apiKey = candidates[i];
+
+    // 客户端已断连就别再浪费上游调用
+    if (signal?.aborted) {
+      return { ...(last || {}), apiKey, attempts: i, aborted: true,
+        error: last?.error || { status: 499, body: { error: { message: 'Client closed request', type: 'proxy_error' } } } };
+    }
+
+    try {
+      await ensureInitialized(apiKey, signal);
+    } catch (e) {
+      // ensureInitialized 自带兜底；这里仅防御性处理，不阻断转发
+      if (e.name === 'AbortError') throw e;
+      log('warn', 'Key init error (continuing)', { key: keyLabel(apiKey), error: e.message });
+    }
+
+    let response;
+    try {
+      response = await forwardToCC(body, apiKey, incomingHeaders, signal, promptCacheKey);
+    } catch (e) {
+      if (e.name === 'AbortError') throw e; // 客户端断连 → 交给上层既有逻辑
+      const message = `Upstream request failed: ${e.message}`;
+      openKeyBreaker(apiKey, { kind: 'network', status: 0, message });
+      last = { apiKey, attempts: i + 1, error: { status: 502, body: { error: { message, type: 'upstream_error' } } }, status: 0 };
+      log('warn', 'Key attempt failed, trying next account if any', {
+        path, model, key: keyLabel(apiKey), attempt: i + 1, of: limit, error: e.message,
+      });
+      continue;
+    }
+
+    if (response.ok) {
+      closeKeyBreaker(apiKey);
+      if (i > 0) {
+        log('info', 'Failover succeeded on later account', {
+          path, model, key: keyLabel(apiKey), attempt: i + 1, of: limit,
+        });
+      }
+      return { response, apiKey, attempts: i + 1 };
+    }
+
+    const errorText = await response.text().catch(() => '');
+    const mapped = mapCcError(response.status, errorText);
+    const message = mapped.body?.error?.message || '';
+    const kind = classifyUpstreamFailure(response.status, message);
+    openKeyBreaker(apiKey, { kind, status: response.status, message });
+
+    last = { apiKey, attempts: i + 1, status: response.status, error: mapped };
+
+    if (!isFailoverWorthy(response.status)) {
+      log('warn', 'Upstream rejected request (not key-related); not failing over', {
+        path, model, status: response.status, key: keyLabel(apiKey),
+      });
+      break;
+    }
+
+    log('warn', 'Key attempt failed, trying next account if any', {
+      path, model, key: keyLabel(apiKey), attempt: i + 1, of: limit, status: response.status, kind,
+    });
+  }
+
+  return { ...(last || {}), exhausted: true,
+    error: last?.error || { status: 502, body: { error: { message: 'No usable upstream account', type: 'upstream_error' } } } };
+}
+
+// 请求进行中（尚未向客户端写出任何字节）发现上游错误时，切换到下一个账号重试。
+// 返回下一个候选密钥，或 null 表示没有可换的账号了。
+function failoverToNextKey(candidates, triedKeys, { status, message, path, model }) {
+  const kind = classifyUpstreamFailure(status, message);
+  openKeyBreaker(triedKeys[triedKeys.length - 1], { kind, status, message });
+  if (!isFailoverWorthy(status)) return null;
+  const next = nextKeyCandidate(candidates, triedKeys);
+  if (!next) return null;
+  log('warn', 'Upstream error before first byte; retrying on next account', {
+    path, model, status, kind, from: keyLabel(triedKeys[triedKeys.length - 1]), to: keyLabel(next),
+  });
+  return next;
+}
+
 // ── 路由 ────────────────────────────────────────────
 
 async function handleChatCompletions(req, res) {
@@ -954,12 +1288,13 @@ async function handleChatCompletions(req, res) {
     return;
   }
 
-  const apiKey = getApiKey(req.headers, isLoopbackRequest(req));
-  if (!apiKey) {
+  const keyCandidates = resolveKeyCandidates(req.headers, isLoopbackRequest(req));
+  if (!keyCandidates.keys.length) {
     sendJSON(res, 401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header', type: 'auth_error' } });
     return;
   }
-
+  const triedKeys = [];
+  let ccResponse = null;
   const stream = openaiReq.stream === true;
   const model = openaiReq.model || 'deepseek/deepseek-v4.1-flash';
   const completionId = `chatcmpl-${randomUUID().slice(0, 12)}`;
@@ -978,18 +1313,59 @@ async function handleChatCompletions(req, res) {
   let translator = null;
 
   try {
-    // 首次初始化（fingerprint + lifecycle）
-    await ensureInitialized(apiKey, abortController.signal);
-    // 转发到 CC API（传入客户端 headers，用于提取 session ID）
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, openaiReq.prompt_cache_key);
+    // 取上游响应：额度耗尽 / 鉴权失败 / 5xx / 网络错误时会自动切换账号重试，
+    // 此阶段还没有任何字节写回客户端，切换对下游完全透明。
+    const acquired = await forwardToCCWithFailover({
+      body: ccBody,
+      candidates: keyCandidates.keys,
+      incomingHeaders: req.headers,
+      signal: abortController.signal,
+      promptCacheKey: openaiReq.prompt_cache_key,
+      path: '/v1/chat/completions',
+      model,
+    });
 
-    if (!ccResponse.ok) {
-      const errorText = await ccResponse.text().catch(() => '');
-      log('error', 'CC API error', { status: ccResponse.status });
-      const mapped = mapCcError(ccResponse.status, errorText);
+    if (!acquired.response) {
+      const mapped = acquired.error || { status: 502, body: { error: { message: 'Upstream request failed', type: 'upstream_error' } } };
       sendJSON(res, mapped.status, mapped.body);
       return;
     }
+    ccResponse = acquired.response;
+    triedKeys.push(acquired.apiKey);
+
+    // 上游在「尚未向客户端写出任何字节」时报错时，用剩余账号重试。
+    // 这个前置条件（started=false / 未发 header）是安全重试的充要条件：
+    // 一旦有字节到达客户端就无法回退，重试会造成重复输出与重复计费。
+    const retryOnNextAccount = async (status, message) => {
+      const kind = classifyUpstreamFailure(status, message);
+      openKeyBreaker(triedKeys[triedKeys.length - 1], { kind, status, message });
+      if (!isFailoverWorthy(status)) return false;
+      const limit = CFG.maxKeyAttempts > 0 ? CFG.maxKeyAttempts : Infinity;
+      if (triedKeys.length >= limit) return false;
+      const remaining = keyCandidates.keys.filter(k => !triedKeys.includes(k));
+      if (!remaining.length) return false;
+
+      log('warn', 'Upstream error before first byte; retrying on next account', {
+        path: '/v1/chat/completions', model,
+        status, kind, tried: triedKeys.map(keyLabel), remaining: remaining.length,
+      });
+
+      const retry = await forwardToCCWithFailover({
+        body: ccBody,
+        candidates: remaining,
+        incomingHeaders: req.headers,
+        signal: abortController.signal,
+        promptCacheKey: openaiReq.prompt_cache_key,
+        path: '/v1/chat/completions',
+        model,
+      });
+      if (!retry.response) return false;
+
+      ccResponse = retry.response;
+      triedKeys.push(retry.apiKey);
+      bytesReceived = 0; lastCcEvent = ''; keepaliveCount = 0; // 每个账号独立计数
+      return true;
+    };
 
     // 下游断连检测：打断 CC 上游 + 记录日志
     res.on('close', () => {
@@ -1029,9 +1405,13 @@ async function handleChatCompletions(req, res) {
 
     if (stream) {
       // ── 流式响应 ──
+      // 外层循环：仅当「上游在写出任何字节之前就报错」时才会用下一个账号重试。
+      // started=true 之后已有字节抵达客户端，无法回退，绝不能重试（会重复计费/重复输出）。
+      streamAttempt: for (;;) {
       translator = createSseTranslator(model, completionId, created);
       let buffer = '';
       let started = false; // 延迟写 200 header，超时/output=0 时返回 JSON 429/502 让 SDK 自动重试
+      let earlyError = false; // 首字节前收到上游 error 事件 → 停在这里交给重试逻辑
       const decoder = new TextDecoder();
       reader = ccResponse.body.getReader();
 
@@ -1057,6 +1437,10 @@ async function handleChatCompletions(req, res) {
           let hadOutput = false;
           for (const line of lines) {
             const events = translator.parseLine(line);
+            // 首字节前就收到上游 error 事件：立刻停止解析，绝不能继续往下写。
+            // 一旦写了任何字节（包括后续 finish 产生的 chunk），started 置位，
+            // 换账号重试就不可能了，客户端只能收到一个错误流。
+            if (translator.upstreamError && !started) { earlyError = true; break; }
             if (events) {
               if (!started) {
                 res.writeHead(200, {
@@ -1073,6 +1457,7 @@ async function handleChatCompletions(req, res) {
             }
             if (translator.lastCcEvent) lastCcEvent = translator.lastCcEvent;
           }
+          if (earlyError) break;
           // silent events 期间发 keepalive，防止客户端超时断开
           if (started && !hadOutput) {
             try { res.write(': keepalive\n\n'); keepaliveCount++; } catch {}
@@ -1081,6 +1466,16 @@ async function handleChatCompletions(req, res) {
         }
 
         if (!aborted) {
+          // 首字节前的上游错误：先尝试换账号，不能重试才把错误报给客户端。
+          // 必须放在处理剩余 buffer 之前——否则残余事件会先把字节写出去。
+          if (translator.upstreamError && !started) {
+            const eu = translator.upstreamError;
+            if (await retryOnNextAccount(eu.status, eu.body?.error?.message || '')) {
+              continue streamAttempt;
+            }
+            sendJSON(res, eu.status, eu.body);
+            return;
+          }
           // 成功完成一次请求，重置连续超时计数
           consecutiveTimeouts = 0;
           // 处理剩余 buffer
@@ -1094,7 +1489,11 @@ async function handleChatCompletions(req, res) {
           }
           if (translator.upstreamError) {
             if (!started) {
-              sendJSON(res, translator.upstreamError.status, translator.upstreamError.body);
+              const eu = translator.upstreamError;
+              if (await retryOnNextAccount(eu.status, eu.body?.error?.message || '')) {
+                continue streamAttempt;
+              }
+              sendJSON(res, eu.status, eu.body);
               return;
             }
             try { res.write(`data: ${JSON.stringify(translator.upstreamError.body)}\n\n`); } catch {}
@@ -1155,6 +1554,10 @@ async function handleChatCompletions(req, res) {
           log('error', 'Stream error', { message: e.message });
           try { abortController.abort(); } catch {} // 打断 CC 上游
           if (!started) {
+            // 连接中断且尚无任何字节下发 → 可以安全地换账号重试
+            if (await retryOnNextAccount(502, e.message)) {
+              continue streamAttempt;
+            }
             sendJSON(res, 502, { error: { message: `Upstream error: ${e.message}`, type: 'proxy_error', input_tokens: 0 }, retry_after: 10 });
             return;
           }
@@ -1166,9 +1569,14 @@ async function handleChatCompletions(req, res) {
         idle.dispose();
       }
 
+      break; // 本次流式尝试结束，退出重试循环
+      } // streamAttempt
+
       if (!res.writableEnded) res.end();
     } else {
       // ── 非流式响应（缓冲完整 NDJSON）──
+      // 非流式在全部读完之前不写任何字节，因此整段都可以安全地用下一个账号重试。
+      nonStreamAttempt: for (;;) {
       let reasoningContent = '';
       let finishReason = 'stop';
       let usage = null;
@@ -1238,6 +1646,9 @@ async function handleChatCompletions(req, res) {
       processLines();
 
       if (upstreamError) {
+        if (await retryOnNextAccount(upstreamError.status, upstreamError.body?.error?.message || '')) {
+          continue nonStreamAttempt;
+        }
         sendJSON(res, upstreamError.status, upstreamError.body);
         return;
       }
@@ -1275,6 +1686,8 @@ async function handleChatCompletions(req, res) {
       };
     })(),
       });
+      break; // 非流式尝试成功，退出重试循环
+      } // nonStreamAttempt
     }
   } catch (e) {
     if (abortController.signal.aborted) {
@@ -1752,12 +2165,13 @@ async function handleMessages(req, res) {
     return;
   }
 
-  const apiKey = getApiKey(req.headers, isLoopbackRequest(req));
-  if (!apiKey) {
+  const keyCandidates = resolveKeyCandidates(req.headers, isLoopbackRequest(req));
+  if (!keyCandidates.keys.length) {
     sendJSON(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header' } });
     return;
   }
-
+  const triedKeys = [];
+  let ccResponse = null;
   const stream = anthropicReq.stream === true;
   const model = anthropicReq.model || 'deepseek/deepseek-v4.1-flash';
 
@@ -1774,17 +2188,54 @@ async function handleMessages(req, res) {
   let bytesReceived = 0; let lastCcEvent = ''; let fullText = '';
 
   try {
-    // 首次初始化（fingerprint + lifecycle）
-    await ensureInitialized(apiKey, abortController.signal);
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
+    // 取上游响应：额度耗尽 / 鉴权失败 / 5xx / 网络错误时自动切换账号重试
+    const acquired = await forwardToCCWithFailover({
+      body: ccBody,
+      candidates: keyCandidates.keys,
+      incomingHeaders: req.headers,
+      signal: abortController.signal,
+      path: '/v1/messages',
+      model,
+    });
 
-    if (!ccResponse.ok) {
-      const errorText = await ccResponse.text().catch(() => '');
-      log('error', 'CC API error (Anthropic)', { status: ccResponse.status });
-      const mapped = mapCcError(ccResponse.status, errorText);
+    if (!acquired.response) {
+      const mapped = acquired.error || { status: 502, body: { error: { message: 'Upstream request failed', type: 'upstream_error' } } };
       sendAnthropicError(res, mapped.status, mapped.body.error.type, mapped.body.error.message);
       return;
     }
+    ccResponse = acquired.response;
+    triedKeys.push(acquired.apiKey);
+
+    // 首字节之前的上游错误 → 换账号重试（同 chat 端点，安全性由 started=false 保证）
+    const retryOnNextAccount = async (status, message) => {
+      const kind = classifyUpstreamFailure(status, message);
+      openKeyBreaker(triedKeys[triedKeys.length - 1], { kind, status, message });
+      if (!isFailoverWorthy(status)) return false;
+      const limit = CFG.maxKeyAttempts > 0 ? CFG.maxKeyAttempts : Infinity;
+      if (triedKeys.length >= limit) return false;
+      const remaining = keyCandidates.keys.filter(k => !triedKeys.includes(k));
+      if (!remaining.length) return false;
+
+      log('warn', 'Upstream error before first byte; retrying on next account', {
+        path: '/v1/messages', model,
+        status, kind, tried: triedKeys.map(keyLabel), remaining: remaining.length,
+      });
+
+      const retry = await forwardToCCWithFailover({
+        body: ccBody,
+        candidates: remaining,
+        incomingHeaders: req.headers,
+        signal: abortController.signal,
+        path: '/v1/messages',
+        model,
+      });
+      if (!retry.response) return false;
+
+      ccResponse = retry.response;
+      triedKeys.push(retry.apiKey);
+      bytesReceived = 0; lastCcEvent = '';
+      return true;
+    };
 
     // 下游断连检测：打断 CC 上游 + 记录日志
     res.on('close', () => {
@@ -1817,6 +2268,8 @@ async function handleMessages(req, res) {
       // 发 header——之前扣到 text_delta 才发，推理模型 thinking 阶段客户端收不到任何
       // 字节，触发下游 60s 首字节超时（context canceled）。message_start 仍缓冲：
       // 完全无输出时还能回 JSON 429/502 让 SDK 自动重试（同 chat 端点）。
+      // 外层循环：仅当 started=false（尚无任何字节下发）时才换账号重试。
+      streamAttempt: for (;;) {
       let started = false;
       const buf = [];
       const SSE_HEADERS = {
@@ -1854,6 +2307,9 @@ async function handleMessages(req, res) {
         const generator = createAnthropicSseTranslator(ccResponse, model, messageId, ctx);
         for await (const event of generator) {
           if (aborted) break;
+          // 首字节前的上游 error 帧：不要 flush，否则 started 置位、重试机会就没了。
+          // message_start 一直缓冲到首个真实内容事件，正是为了让这里还能回退。
+          if (!started && event.startsWith('event: error')) break;
           if (!started && !event.startsWith('event: message_start')) {
             await flushBuf();
           }
@@ -1870,11 +2326,15 @@ async function handleMessages(req, res) {
           consecutiveTimeouts = 0;
           if (ctx.upstreamError) {
             if (!started) {
+              const eu = ctx.upstreamError;
+              if (await retryOnNextAccount(eu.status, eu.body?.error?.message || '')) {
+                continue streamAttempt;
+              }
               sendAnthropicError(
                 res,
-                ctx.upstreamError.status,
-                ctx.upstreamError.body.error.type,
-                ctx.upstreamError.body.error.message,
+                eu.status,
+                eu.body.error.type,
+                eu.body.error.message,
               );
             }
             // started 时 error 事件已在循环中经 SSE 下发，按规范 error 事件即终结
@@ -1927,6 +2387,10 @@ async function handleMessages(req, res) {
           log('error', 'Anthropic stream error', { message: e.message });
           try { abortController.abort(); } catch {} // 打断 CC 上游
           if (!started) {
+            // 连接中断且尚无任何字节下发 → 可以安全地换账号重试
+            if (await retryOnNextAccount(502, e.message)) {
+              continue streamAttempt;
+            }
             sendAnthropicError(res, 502, 'proxy_error', `Upstream error: ${e.message}`, 10);
             return;
           }
@@ -1940,9 +2404,14 @@ async function handleMessages(req, res) {
         clearInterval(heartbeat);
       }
 
+      break; // 本次流式尝试结束，退出重试循环
+      } // streamAttempt
+
       if (!res.writableEnded) res.end();
     } else {
       // ── 非流式 Anthropic JSON ──
+      // 非流式在读完全部内容前不写任何字节，整段都可安全重试
+      nonStreamAttempt: for (;;) {
       const messageId = 'msg_' + randomUUID().slice(0, 12);
       let finishReason = 'stop';
       let usage = null;
@@ -2012,6 +2481,9 @@ async function handleMessages(req, res) {
       processLines();
 
       if (upstreamError) {
+        if (await retryOnNextAccount(upstreamError.status, upstreamError.body?.error?.message || '')) {
+          continue nonStreamAttempt;
+        }
         sendAnthropicError(res, upstreamError.status, upstreamError.body.error.type, upstreamError.body.error.message);
         return;
       }
@@ -2026,6 +2498,8 @@ async function handleMessages(req, res) {
 
       consecutiveTimeouts = 0;
       sendJSON(res, 200, buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage, thinkingText));
+      break; // 非流式尝试成功，退出重试循环
+      } // nonStreamAttempt
     }
   } catch (e) {
     if (abortController.signal.aborted) {
@@ -2135,19 +2609,45 @@ async function fetchModels(apiKey) {
 }
 
 async function handleModels(req, res) {
-  const apiKey = getApiKey(req.headers, isLoopbackRequest(req));
-  try {
-    const models = await fetchModels(apiKey);
-    sendJSON(res, 200, { object: 'list', data: models });
-  } catch (e) {
-    const status = e instanceof ModelsUpstreamError ? e.status : 502;
-    sendJSON(res, status, {
-      error: {
-        message: e.message || 'Unable to fetch available models',
-        type: status === 401 ? 'authentication_error' : 'upstream_error',
-      },
-    });
+  const { keys } = resolveKeyCandidates(req.headers, isLoopbackRequest(req));
+  if (!keys.length) {
+    sendJSON(res, 401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header', type: 'authentication_error' } });
+    return;
   }
+
+  // 模型列表也是账号级接口：某个账号额度耗尽时同样自动切换
+  let lastError = null;
+  const limit = CFG.maxKeyAttempts > 0 ? Math.min(CFG.maxKeyAttempts, keys.length) : keys.length;
+  for (let i = 0; i < limit; i++) {
+    const apiKey = keys[i];
+    try {
+      const models = await fetchModels(apiKey);
+      closeKeyBreaker(apiKey);
+      sendJSON(res, 200, { object: 'list', data: models });
+      return;
+    } catch (e) {
+      lastError = e;
+      const status = e instanceof ModelsUpstreamError ? e.status : 502;
+      // 只有「换账号可能成功」的错误才继续尝试下一个账号
+      if (!isFailoverWorthy(status) || i === limit - 1) break;
+      openKeyBreaker(apiKey, {
+        kind: classifyUpstreamFailure(status, e.message),
+        status,
+        message: e.message,
+      });
+      log('warn', 'Models fetch failed on account; trying next', {
+        key: keyLabel(apiKey), attempt: i + 1, of: limit, status,
+      });
+    }
+  }
+
+  const status = lastError instanceof ModelsUpstreamError ? lastError.status : 502;
+  sendJSON(res, status, {
+    error: {
+      message: lastError?.message || 'Unable to fetch available models',
+      type: status === 401 ? 'authentication_error' : 'upstream_error',
+    },
+  });
 }
 
 function handleHealth(req, res) {
@@ -2224,6 +2724,10 @@ process.on('unhandledRejection', (reason) => {
   }
 });
 
+// 启动时恢复上次的熔断状态：否则重启会「忘记」某个账号已额度耗尽，
+// 立刻又去撞一次已经失败的账号。
+loadKeyBreakerState();
+
 server.listen(CFG.port, CFG.host, () => {
   log('info', 'CC Proxy started', {
     url: `http://${CFG.host}:${CFG.port}`,
@@ -2236,6 +2740,16 @@ server.listen(CFG.port, CFG.host, () => {
     clientDrainTimeout: CLIENT_DRAIN_TIMEOUT_MS > 0 ? `${CLIENT_DRAIN_TIMEOUT_MS}ms` : 'disabled',
     idleTimeouts: `stream ${STREAM_IDLE_TIMEOUT_MS}ms / nonstream ${NONSTREAM_IDLE_TIMEOUT_MS}ms`,
     maxInflight: MAX_INFLIGHT > 0 ? `${MAX_INFLIGHT} (global, /health exempt)` : 'unlimited (CC_MAX_INFLIGHT=0)',
+    keyPool: (() => {
+      const pool = getConfiguredApiKeys();
+      if (!pool.length) return 'none configured (client must send its own key)';
+      if (!CFG.keyFailover) return `1 key (failover disabled)`;
+      const cooling = pool.filter(k => keyCoolingRemainingMs(k) > 0).length;
+      const longH = (CFG.keyCooldownMs / 3600000).toFixed(1);
+      const shortS = Math.round(CFG.keyShortCooldownMs / 1000);
+      return `${pool.length} key(s), ${pool.length - cooling} ready / ${cooling} cooling` +
+        ` (quota+auth cooldown ${longH}h, transient ${shortS}s)`;
+    })(),
   });
   if (CLIENT_DRAIN_TIMEOUT_MS > 0) {
     log('info', 'Client drain timeout enabled', { timeoutMs: CLIENT_DRAIN_TIMEOUT_MS });
@@ -2250,7 +2764,7 @@ server.listen(CFG.port, CFG.host, () => {
       hint: 'lower CC_MAX_BODY_MB and/or cap in-flight requests at the reverse proxy (see README)',
     });
   }
-  if (!CFG.apiKey) {
+  if (!CFG.apiKey && !getConfiguredApiKeys().length) {
     log('info', 'No API key in config. API key must be sent in Authorization: Bearer <key> header per request.');
   }
 });

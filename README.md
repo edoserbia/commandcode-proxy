@@ -58,10 +58,62 @@ commandcode/
 | `apiKey` | `""` | Optional fallback API key (requests can also send it via header) |
 | `logFile` | `""` | Log file path (empty = console only) |
 | `logLevel` | `info` | Log level |
-| `apiKeyFile` | `""` | Optional local credential file; reads `CC_DEEPSEEK_API_KEY` for loopback clients using `PROXY_MANAGED` |
+| `apiKeyFile` | `""` | Optional local credential file; reads `CC_DEEPSEEK_API_KEY` for loopback clients using `PROXY_MANAGED`. May also list `CC_DEEPSEEK_API_KEY_2`, `_3`, … to build a key pool |
+| `apiKeys` | `[]` | Ordered list of account keys; takes precedence over `apiKey` / `apiKeyFile`. Duplicates are collapsed |
+| `keyFailover` | `true` | Automatically try the next account when one is exhausted or failing |
+| `keyCooldownMs` | `604800000` | Cooldown for quota/auth failures (1 week — matches a weekly cap reset) |
+| `keyShortCooldownMs` | `60000` | Cooldown for transient failures (`429` rate limit, `5xx`, network) |
+| `keyStateFile` | `""` | Where breaker state is persisted (default `<proxy dir>/.key-health.json`). Only SHA-256 fingerprints are stored |
+| `maxKeyAttempts` | `0` | Max accounts tried per request (`0` = try every candidate) |
 | `useProviderModels` | `true` | Dynamically fetch model list from Provider API |
 | `modelRefreshIntervalMs` | `300000` | Model list cache refresh interval (5 min) |
 | `zdr` | `false` | Request ZDR-only routing from Command Code |
+
+### Multiple Accounts / Automatic Failover
+
+A pool of CommandCode account keys is tried in order; when one runs out of quota
+it is parked and the next one takes over with no client-visible difference.
+
+```jsonc
+// config.json — non-secret settings. The key values themselves are better kept
+// in the protected credential file (see apiKeyFile) so they stay out of the repo.
+{
+  "apiKeys": ["user_aaaaaaaa", "user_bbbbbbbb"],
+  "keyFailover": true,
+  "keyCooldownMs": 604800000,     // 1 week: quota exhausted / invalid key
+  "keyShortCooldownMs": 60000     // 60s: rate limit, 5xx, network errors
+}
+```
+
+Or list the keys in the protected credential file and let the proxy pick them up:
+
+```yaml
+# the file referenced by apiKeyFile (e.g. ~/.dsh/.credentials.yaml)
+refs:
+  CC_DEEPSEEK_API_KEY: user_aaaaaaaa
+  CC_DEEPSEEK_API_KEY_2: user_bbbbbbbb
+```
+
+How failures are classified:
+
+| Upstream result | Cooldown | Fails over |
+|---|---|---|
+| `402` payment required, quota/balance wording in a `429`, `401`/`403` | `keyCooldownMs` (1 week) | yes |
+| `429` rate limit, `5xx`, connection reset, timeout | `keyShortCooldownMs` (60s) | yes |
+| `400`, `404`, `422` (the request itself is wrong) | none | **no** |
+
+Failover only happens before the first byte reaches the client. Once a response
+has started streaming it cannot be taken back, so the upstream error is passed
+through rather than retried — this prevents duplicated output and double billing.
+The same rule lets in-band errors (an `HTTP 200` stream carrying an `error` event)
+fail over transparently, because the proxy deliberately buffers the first event
+until real content arrives.
+
+A key supplied explicitly by the client (`Authorization` / `x-api-key` holding a
+real `user_…` key) is used as-is and is never swapped for a pool account, so one
+caller's key is never spent on another's behalf. Breaker state is persisted, so
+restarting the proxy does not forget an account that is out of quota. If every key
+is cooling the pool is still probed in order rather than deadlocking.
 
 ### Environment Variables
 
@@ -72,6 +124,12 @@ commandcode/
 | `CC_API_BASE` | `apiBase` |
 | `PROJECT_SLUG` | `projectSlug` |
 | `LOG_FILE` | `logFile` |
+| `CC_API_KEYS` | `apiKeys` (comma/space separated, ordered) |
+| `CC_KEY_FAILOVER` | `keyFailover` (`false` to disable) |
+| `CC_KEY_COOLDOWN_MS` | `keyCooldownMs` |
+| `CC_KEY_SHORT_COOLDOWN_MS` | `keyShortCooldownMs` |
+| `CC_KEY_STATE_FILE` | `keyStateFile` |
+| `CC_MAX_KEY_ATTEMPTS` | `maxKeyAttempts` |
 | `CC_USE_PROVIDER_MODELS` | `useProviderModels` |
 | `CC_STREAM_IDLE_MS` | Streaming upstream read idle timeout (default `30000`) |
 | `CC_NONSTREAM_IDLE_MS` | Non-streaming upstream read idle timeout (default `90000`) |

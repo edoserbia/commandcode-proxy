@@ -58,10 +58,59 @@ commandcode/
 | `apiKey` | `""` | 可选兜底 API Key（请求也可通过 header 传入） |
 | `logFile` | `""` | 日志文件路径（空=仅控制台） |
 | `logLevel` | `info` | 日志级别 |
-| `apiKeyFile` | `""` | 可选本机凭据文件；本机客户端使用 `PROXY_MANAGED` 时读取其中的 `CC_DEEPSEEK_API_KEY` |
+| `apiKeyFile` | `""` | 可选本机凭据文件；本机客户端使用 `PROXY_MANAGED` 时读取其中的 `CC_DEEPSEEK_API_KEY`。也可同时列出 `CC_DEEPSEEK_API_KEY_2`、`_3` … 组成密钥池 |
+| `apiKeys` | `[]` | 有序账号密钥列表；设置后优先于 `apiKey` / `apiKeyFile`。重复项会自动去重 |
+| `keyFailover` | `true` | 某个账号额度耗尽或报错时自动切换到下一个账号 |
+| `keyCooldownMs` | `604800000` | 额度/鉴权类失败的冷却时长（1 周，对应每周限额重置周期） |
+| `keyShortCooldownMs` | `60000` | 瞬时类失败的冷却时长（`429` 限流、`5xx`、网络错误） |
+| `keyStateFile` | `""` | 熔断状态落盘路径（默认 `<代理目录>/.key-health.json`）。只写入 SHA-256 指纹，不写明文密钥 |
+| `maxKeyAttempts` | `0` | 单个请求最多尝试几个账号（`0` = 试完所有候选） |
 | `useProviderModels` | `true` | 从 Provider API 动态拉取模型列表 |
 | `modelRefreshIntervalMs` | `300000` | 模型列表缓存刷新间隔（5min） |
 | `zdr` | `false` | 请求 Command Code 使用 ZDR-only 路由 |
+
+### 多账号与自动故障转移
+
+代理按顺序使用密钥池中的账号；某个账号额度用完后会被熔断，由下一个账号接管，
+客户端完全无感知，不需要人工切换。
+
+```jsonc
+// config.json —— 只放非敏感配置。密钥本身建议放在受保护的凭据文件里，
+// 这样不会进入仓库（见 apiKeyFile）。
+{
+  "apiKeys": ["user_aaaaaaaa", "user_bbbbbbbb"],
+  "keyFailover": true,
+  "keyCooldownMs": 604800000,     // 1 周：额度耗尽 / 密钥失效
+  "keyShortCooldownMs": 60000     // 60s：限流、5xx、网络错误
+}
+```
+
+也可以把密钥写在受保护的凭据文件里，由代理自动读取：
+
+```yaml
+# apiKeyFile 指向的文件（例如 ~/.dsh/.credentials.yaml）
+refs:
+  CC_DEEPSEEK_API_KEY: user_aaaaaaaa
+  CC_DEEPSEEK_API_KEY_2: user_bbbbbbbb
+```
+
+失败分类规则：
+
+| 上游返回 | 冷却时长 | 是否切换账号 |
+|---|---|---|
+| `402` 需要付费、`429` 且文案含额度/余额字样、`401`/`403` | `keyCooldownMs`（1 周） | 是 |
+| `429` 限流、`5xx`、连接被重置、超时 | `keyShortCooldownMs`（60秒） | 是 |
+| `400`、`404`、`422`（请求本身有问题） | 不冷却 | **否** |
+
+故障转移只在「首字节尚未发给客户端」时进行。响应一旦开始流式输出就无法收回，
+此时会把上游错误如实透传而不是重试 —— 避免重复输出与重复计费。同一条规则让
+「带内错误」（`HTTP 200` 的流里出现 `error` 事件）也能透明切换：代理刻意把首个
+事件缓冲到真正有内容时才下发，就是为了保留这个可回退窗口。
+
+客户端自带真实密钥（`Authorization` / `x-api-key` 里是 `user_…` 格式）时，只使用该
+密钥，绝不会换用池中其他账号 —— 避免一个调用方消耗另一个账号的额度。熔断状态会
+持久化，重启代理不会「忘记」某个已耗尽额度的账号。若所有账号都在冷却中，仍会按序
+探测（半开），不会彻底锁死。
 
 ### 环境变量
 
@@ -72,6 +121,12 @@ commandcode/
 | `CC_API_BASE` | `apiBase` |
 | `PROJECT_SLUG` | `projectSlug` |
 | `LOG_FILE` | `logFile` |
+| `CC_API_KEYS` | `apiKeys`（逗号/空格分隔，有序） |
+| `CC_KEY_FAILOVER` | `keyFailover`（`false` 关闭） |
+| `CC_KEY_COOLDOWN_MS` | `keyCooldownMs` |
+| `CC_KEY_SHORT_COOLDOWN_MS` | `keyShortCooldownMs` |
+| `CC_KEY_STATE_FILE` | `keyStateFile` |
+| `CC_MAX_KEY_ATTEMPTS` | `maxKeyAttempts` |
 | `CC_USE_PROVIDER_MODELS` | `useProviderModels` |
 | `CC_STREAM_IDLE_MS` | 流式上游读空闲超时（默认 `30000`）|
 | `CC_NONSTREAM_IDLE_MS` | 非流式上游读空闲超时（默认 `90000`）|
