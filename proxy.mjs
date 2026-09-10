@@ -21,6 +21,7 @@ function loadConfig() {
     logFile: '',
     logLevel: 'info',
     apiKeyFile: '',
+    apiKeyFiles: [],              // 额外凭据文件（字符串或数组）；与 apiKeyFile 一起按顺序读取
     useProviderModels: true,
     modelRefreshIntervalMs: 5 * 60 * 1000,  // 5 minutes
     zdr: false,
@@ -51,6 +52,9 @@ function loadConfig() {
   if (process.env.PROJECT_SLUG) defaults.projectSlug = process.env.PROJECT_SLUG;
   if (process.env.LOG_FILE) defaults.logFile = process.env.LOG_FILE;
   if (process.env.CC_API_KEY_FILE) defaults.apiKeyFile = process.env.CC_API_KEY_FILE;
+  if (process.env.CC_API_KEY_FILES) {
+    defaults.apiKeyFiles = process.env.CC_API_KEY_FILES.split(',').map(s => s.trim()).filter(Boolean);
+  }
   if (process.env.CC_USE_PROVIDER_MODELS) defaults.useProviderModels = process.env.CC_USE_PROVIDER_MODELS !== 'false';
   if (process.env.CMD_ZDR !== undefined) defaults.zdr = process.env.CMD_ZDR === '1';
   if (process.env.CC_EMPTY_SYSTEM_PLACEHOLDER) defaults.emptySystemPlaceholder = process.env.CC_EMPTY_SYSTEM_PLACEHOLDER !== 'false';
@@ -1093,7 +1097,20 @@ function readKeysFromFile(path) {
   }
 }
 
-// 有序密钥池：apiKeys（数组）优先，其次 apiKey（单个），最后 apiKeyFile（可含多个）
+// 有序密钥池：apiKeys（数组）优先，其次 apiKey（单个），最后凭据文件（可含多个）。
+// apiKeyFile / apiKeyFiles 都可以是路径或路径数组 —— 这样第一个账号可以继续放在
+// 被其他工具托管的凭据文件里，额外账号放在代理自己拥有的文件里，互不干扰。
+function getConfiguredApiKeyFiles() {
+  const out = [];
+  const add = (v) => {
+    if (typeof v === 'string' && v.trim()) out.push(v.trim());
+    else if (Array.isArray(v)) for (const item of v) add(item);
+  };
+  add(CFG.apiKeyFile);
+  add(CFG.apiKeyFiles);
+  return [...new Set(out)];
+}
+
 function getConfiguredApiKeys() {
   const pool = [];
   const push = (k) => {
@@ -1106,7 +1123,9 @@ function getConfiguredApiKeys() {
     for (const k of CFG.apiKeys) push(k);
   } else {
     push(CFG.apiKey);
-    for (const k of readKeysFromFile(CFG.apiKeyFile)) push(k);
+    for (const file of getConfiguredApiKeyFiles()) {
+      for (const k of readKeysFromFile(file)) push(k);
+    }
   }
   return pool;
 }

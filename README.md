@@ -58,7 +58,8 @@ commandcode/
 | `apiKey` | `""` | Optional fallback API key (requests can also send it via header) |
 | `logFile` | `""` | Log file path (empty = console only) |
 | `logLevel` | `info` | Log level |
-| `apiKeyFile` | `""` | Optional local credential file; reads `CC_DEEPSEEK_API_KEY` for loopback clients using `PROXY_MANAGED`. May also list `CC_DEEPSEEK_API_KEY_2`, `_3`, … to build a key pool |
+| `apiKeyFile` | `""` | Optional local credential file; reads `CC_DEEPSEEK_API_KEY` for loopback clients using `PROXY_MANAGED`. May also list `CC_DEEPSEEK_API_KEY_2`, `_3`, … to build a key pool. Accepts a path or an array of paths |
+| `apiKeyFiles` | `[]` | Additional credential files, read after `apiKeyFile` (string or array). Useful for keeping a second account in a file the proxy owns |
 | `apiKeys` | `[]` | Ordered list of account keys; takes precedence over `apiKey` / `apiKeyFile`. Duplicates are collapsed |
 | `keyFailover` | `true` | Automatically try the next account when one is exhausted or failing |
 | `keyCooldownMs` | `604800000` | Cooldown for quota/auth failures (1 week — matches a weekly cap reset) |
@@ -94,6 +95,17 @@ refs:
   CC_DEEPSEEK_API_KEY_2: user_bbbbbbbb
 ```
 
+If the first file is owned by another tool that may rewrite it, keep extra accounts
+in a separate file and list it as well — the keys are concatenated in order:
+
+```jsonc
+// config.json — paths only, no secrets
+{
+  "apiKeyFile": "/Users/me/.dsh/.credentials.yaml",
+  "apiKeyFiles": ["/Users/me/.commandcode-accounts.yaml"]
+}
+```
+
 How failures are classified:
 
 | Upstream result | Cooldown | Fails over |
@@ -125,6 +137,7 @@ is cooling the pool is still probed in order rather than deadlocking.
 | `PROJECT_SLUG` | `projectSlug` |
 | `LOG_FILE` | `logFile` |
 | `CC_API_KEYS` | `apiKeys` (comma/space separated, ordered) |
+| `CC_API_KEY_FILES` | `apiKeyFiles` (comma separated) |
 | `CC_KEY_FAILOVER` | `keyFailover` (`false` to disable) |
 | `CC_KEY_COOLDOWN_MS` | `keyCooldownMs` |
 | `CC_KEY_SHORT_COOLDOWN_MS` | `keyShortCooldownMs` |

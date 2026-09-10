@@ -58,7 +58,8 @@ commandcode/
 | `apiKey` | `""` | 可选兜底 API Key（请求也可通过 header 传入） |
 | `logFile` | `""` | 日志文件路径（空=仅控制台） |
 | `logLevel` | `info` | 日志级别 |
-| `apiKeyFile` | `""` | 可选本机凭据文件；本机客户端使用 `PROXY_MANAGED` 时读取其中的 `CC_DEEPSEEK_API_KEY`。也可同时列出 `CC_DEEPSEEK_API_KEY_2`、`_3` … 组成密钥池 |
+| `apiKeyFile` | `""` | 可选本机凭据文件；本机客户端使用 `PROXY_MANAGED` 时读取其中的 `CC_DEEPSEEK_API_KEY`。也可同时列出 `CC_DEEPSEEK_API_KEY_2`、`_3` … 组成密钥池。支持单个路径或路径数组 |
+| `apiKeyFiles` | `[]` | 额外的凭据文件，在 `apiKeyFile` 之后读取（字符串或数组）。适合把第二个账号放在代理自己拥有的文件里 |
 | `apiKeys` | `[]` | 有序账号密钥列表；设置后优先于 `apiKey` / `apiKeyFile`。重复项会自动去重 |
 | `keyFailover` | `true` | 某个账号额度耗尽或报错时自动切换到下一个账号 |
 | `keyCooldownMs` | `604800000` | 额度/鉴权类失败的冷却时长（1 周，对应每周限额重置周期） |
@@ -94,6 +95,17 @@ refs:
   CC_DEEPSEEK_API_KEY_2: user_bbbbbbbb
 ```
 
+如果第一个文件由别的工具托管、可能被它重写，可以把额外账号放在单独的文件里一并列出，
+密钥会按顺序拼接：
+
+```jsonc
+// config.json —— 只写路径，不含密钥
+{
+  "apiKeyFile": "/Users/me/.dsh/.credentials.yaml",
+  "apiKeyFiles": ["/Users/me/.commandcode-accounts.yaml"]
+}
+```
+
 失败分类规则：
 
 | 上游返回 | 冷却时长 | 是否切换账号 |
@@ -122,6 +134,7 @@ refs:
 | `PROJECT_SLUG` | `projectSlug` |
 | `LOG_FILE` | `logFile` |
 | `CC_API_KEYS` | `apiKeys`（逗号/空格分隔，有序） |
+| `CC_API_KEY_FILES` | `apiKeyFiles`（逗号分隔） |
 | `CC_KEY_FAILOVER` | `keyFailover`（`false` 关闭） |
 | `CC_KEY_COOLDOWN_MS` | `keyCooldownMs` |
 | `CC_KEY_SHORT_COOLDOWN_MS` | `keyShortCooldownMs` |
