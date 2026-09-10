@@ -42,6 +42,10 @@ cleanup() {
     kill "$TEST_PID" 2>/dev/null || true
     wait "$TEST_PID" 2>/dev/null || true
   fi
+  # belt and braces: nothing must be left holding the test port
+  local stray
+  stray=$(lsof -nP -iTCP:"$TEST_PORT" -sTCP:LISTEN 2>/dev/null | awk 'NR>1{print $2}' | sort -u)
+  [ -n "$stray" ] && kill $stray 2>/dev/null || true
   rm -rf "$TEST_DIR"
 }
 trap cleanup EXIT
@@ -58,7 +62,9 @@ smoke_test() {
 { "port": ${TEST_PORT}, "host": "127.0.0.1", "apiKey": "", "projectSlug": "smoke",
   "logLevel": "warn", "useProviderModels": true, "zdr": false }
 EOF
-  ( cd "$TEST_DIR" && PORT="$TEST_PORT" HOST=127.0.0.1 CC_API_KEY_FILE="$KEY_FILE" \
+  # `exec` so the subshell IS the node process: killing TEST_PID then actually
+  # stops the server instead of orphaning it on the test port.
+  ( cd "$TEST_DIR" && exec env PORT="$TEST_PORT" HOST=127.0.0.1 CC_API_KEY_FILE="$KEY_FILE" \
       node proxy.mjs >"$TEST_DIR/out.log" 2>&1 ) &
   TEST_PID=$!
 
