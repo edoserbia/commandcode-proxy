@@ -8,3 +8,4 @@ stdout.txt
 stderr.txt
 captured-requests/
 
+*.bak-*

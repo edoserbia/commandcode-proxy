@@ -1412,6 +1412,16 @@ function convertAnthropicToOpenAI(anthropicReq) {
     }
   }
 
+  // 7b. Claude Code 把思考强度放在 output_config.effort（与 thinking 相互独立）。
+  // 它优先于上面的 thinking 推导，才能把 max/xhigh 完整透传（Claude Code、cc-haha）。
+  const effortFromOutputConfig = anthropicReq.output_config && anthropicReq.output_config.effort;
+  if (typeof effortFromOutputConfig === 'string') {
+    const eff = effortFromOutputConfig.toLowerCase();
+    if (['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(eff)) {
+      openaiReq.reasoning_effort = eff;
+    }
+  }
+
   return openaiReq;
 }
 
