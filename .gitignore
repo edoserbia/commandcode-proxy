@@ -9,3 +9,10 @@ stderr.txt
 captured-requests/
 
 *.bak-*
+
+# 本地私密配置（真实上游 API Key）与熔断状态，切勿提交
+config.local.json
+.key-health.json
+
+# 本地运行时状态（客户端配置、PID、日志）
+.runtime/

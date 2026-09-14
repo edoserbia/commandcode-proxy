@@ -29,19 +29,41 @@ function loadConfig() {
     // ── 多账号密钥池 + 熔断 ──
     apiKeys: [],                  // 有序账号密钥列表；留空则回退到 apiKey / apiKeyFile
     keyFailover: true,            // 是否在账号之间自动故障转移
-    keyCooldownMs: 7 * 24 * 60 * 60 * 1000, // 长冷却 1 周：额度耗尽 / 鉴权失败
-    keyShortCooldownMs: 60 * 1000,          // 短冷却 60s：限流 / 5xx / 网络错误
+    // 阶梯冷却：连续失败逐级升级 5m → 1h → 12h → 24h → 1w，任意一次成功即清零。
+    // 额度耗尽 / 鉴权失效直接跳到最长一级（等 5 分钟没有意义）。
+    keyCooldownLadderMs: [5 * 60 * 1000, 60 * 60 * 1000, 12 * 60 * 60 * 1000, 24 * 60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000],
+    keyCooldownMs: 7 * 24 * 60 * 60 * 1000, // 冷却上限（也是额度/鉴权的固定冷却）
+    keyShortCooldownMs: 5 * 60 * 1000,      // 兼容旧配置：阶梯首级（默认 5 分钟）
     keyStateFile: '',             // 熔断状态落盘路径；留空则用 <proxy 目录>/.key-health.json
     maxKeyAttempts: 0,            // 单次请求最多尝试几个账号；0 = 不限（最多试完全部候选）
   };
 
-  const configPath = resolve(__dirname, 'config.json');
+  // 配置文件路径：默认 proxy.mjs 同目录的 config.json，可用 CC_CONFIG 指向别处
+  // （多实例部署 / 集成测试）
+  const configPath = process.env.CC_CONFIG
+    ? resolve(process.env.CC_CONFIG)
+    : resolve(__dirname, 'config.json');
   if (existsSync(configPath)) {
     try {
       const user = JSON.parse(readFileSync(configPath, 'utf-8'));
       Object.assign(defaults, user);
     } catch (e) {
       console.error('[config] Failed to parse config.json:', e.message);
+    }
+  }
+
+  // 本地私密覆盖：config.local.json（已 gitignore），真实 API Key 放这里，
+  // config.json 只保留可提交的模板与占位符。顶层键整体覆盖，数组不合并。
+  const localPath = process.env.CC_CONFIG_LOCAL
+    ? resolve(process.env.CC_CONFIG_LOCAL)
+    : resolve(dirname(configPath), 'config.local.json');
+  if (existsSync(localPath)) {
+    try {
+      const local = JSON.parse(readFileSync(localPath, 'utf-8'));
+      Object.assign(defaults, local);
+      defaults.localConfigPath = localPath;
+    } catch (e) {
+      console.error('[config] Failed to parse config.local.json:', e.message);
     }
   }
 
@@ -70,7 +92,21 @@ function loadConfig() {
   }
   if (process.env.CC_KEY_SHORT_COOLDOWN_MS) {
     const ms = Number.parseInt(process.env.CC_KEY_SHORT_COOLDOWN_MS, 10);
-    if (Number.isFinite(ms) && ms >= 0) defaults.keyShortCooldownMs = ms;
+    if (Number.isFinite(ms) && ms >= 0) {
+      defaults.keyShortCooldownMs = ms;
+      // 旧配置只给了「短冷却」：把它当作阶梯首级，其余各级按比例放大到上限
+      if (!process.env.CC_KEY_COOLDOWN_LADDER_MS && !Array.isArray(defaults.keyCooldownLadderMs)) {
+        defaults.keyCooldownLadderMs = undefined;
+      }
+    }
+  }
+  // 阶梯可用逗号分隔的毫秒数覆盖：CC_KEY_COOLDOWN_LADDER_MS=300000,3600000,604800000
+  if (process.env.CC_KEY_COOLDOWN_LADDER_MS) {
+    const steps = process.env.CC_KEY_COOLDOWN_LADDER_MS
+      .split(',')
+      .map(s => Number.parseInt(s.trim(), 10))
+      .filter(n => Number.isFinite(n) && n > 0);
+    if (steps.length > 0) defaults.keyCooldownLadderMs = steps;
   }
   if (process.env.CC_KEY_STATE_FILE) defaults.keyStateFile = process.env.CC_KEY_STATE_FILE;
   if (process.env.CC_MAX_KEY_ATTEMPTS) {
@@ -937,6 +973,15 @@ function isLoopbackRequest(req) {
 
 const KEY_QUOTA_HINT = /quota|exceed|insufficient|balance|credit|payment|limit reached|usage limit|额度|余额|超出|限额|用尽|耗尽/i;
 
+// 套餐/权益类错误：账号本身是好的，只是这个模型不在它的套餐里。
+// 这类错误常以 403 返回，但密钥完全有效 —— 若当成 auth 处理会把好账号熔断掉，
+// 连本来能用的模型也一起不可用。典型文案：
+//   MODEL_NOT_IN_PLAN: Claude Sonnet 4.6 available in Pro and above plans
+const KEY_ENTITLEMENT_HINT = /model_not_in_plan|not in (your )?plan|(available|included) in .{0,24}plans?|upgrade (your )?(plan|subscription)|requires? (a )?(pro|max|higher|paid)|plan (does not|doesn't) include|not entitled|套餐|升级|订阅/i;
+
+// 短时限流的信号词：用于避免 "rate limit ... reset" 被误判成额度耗尽
+const KEY_RATE_HINT = /rate ?limit|too many requests|slow down|try again (later|in)|请求(过于)?频繁|限流/i;
+
 function keyFingerprint(apiKey) {
   return crypto.createHash('sha256').update(String(apiKey)).digest('hex').slice(0, 16);
 }
@@ -961,11 +1006,29 @@ function loadKeyBreakerState() {
     const now = Date.now();
     let loaded = 0;
     for (const [fp, entry] of Object.entries(data?.breakers || {})) {
-      if (!entry || typeof entry.until !== 'number' || entry.until <= now) continue; // 已过期，不必恢复
+      if (!entry || typeof entry.until !== 'number') continue;
+      const failures = Number(entry.failures) || 0;
+      if (entry.until <= now) {
+        // 冷却已过期 → 账号恢复可用，但「连续失败次数」必须保留，
+        // 否则重启后阶梯会退回第一级，永远升不上去。
+        if (failures > 0) {
+          keyBreaker.set(fp, {
+            until: 0,
+            kind: entry.kind || 'unknown',
+            status: entry.status ?? 0,
+            failures,
+            message: typeof entry.message === 'string' ? entry.message.slice(0, 200) : '',
+            openedAt: entry.openedAt || now,
+          });
+          loaded++;
+        }
+        continue;
+      }
       keyBreaker.set(fp, {
         until: entry.until,
         kind: entry.kind || 'unknown',
         status: entry.status ?? 0,
+        failures,
         message: typeof entry.message === 'string' ? entry.message.slice(0, 200) : '',
         openedAt: entry.openedAt || now,
       });
@@ -990,6 +1053,7 @@ function persistKeyBreakerState() {
       for (const [fp, entry] of keyBreaker.entries()) {
         breakers[fp] = {
           until: entry.until, kind: entry.kind, status: entry.status,
+          failures: entry.failures || 0,
           message: entry.message, openedAt: entry.openedAt,
         };
       }
@@ -1003,16 +1067,63 @@ function persistKeyBreakerState() {
   if (keyPersistTimer.unref) keyPersistTimer.unref();
 }
 
-function keyCooldownFor(kind) {
-  // 额度/鉴权属于「短期内不会自愈」，用长冷却；其余用短冷却
-  return (kind === 'quota' || kind === 'auth') ? CFG.keyCooldownMs : CFG.keyShortCooldownMs;
+// 冷却阶梯：连续失败逐级升级，最长一周封顶。
+//   第 1 次 → 5 分钟，第 2 次 → 1 小时，第 3 次 → 12 小时，
+//   第 4 次 → 24 小时，第 5 次及以后 → 一周。
+// 额度/鉴权属于「短期内不会自愈」，直接跳到最长一级；
+// 其余（限流、5xx、网络、零输出）走阶梯。
+const KEY_COOLDOWN_LADDER_MS = [5 * 60 * 1000, 60 * 60 * 1000, 12 * 60 * 60 * 1000, 24 * 60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000];
+
+function cooldownLadder() {
+  const configured = Array.isArray(CFG.keyCooldownLadderMs)
+    ? CFG.keyCooldownLadderMs.map(Number).filter(n => Number.isFinite(n) && n > 0).sort((a, b) => a - b)
+    : [];
+  // 未配置阶梯时退回内置阶梯；若用户显式设了 keyShortCooldownMs，用它替换首级
+  let steps = configured;
+  if (steps.length === 0) {
+    steps = [...KEY_COOLDOWN_LADDER_MS];
+    const short = Number(CFG.keyShortCooldownMs);
+    if (Number.isFinite(short) && short > 0 && short !== KEY_COOLDOWN_LADDER_MS[0]) {
+      steps[0] = short;
+      steps.sort((a, b) => a - b);
+      steps = [...new Set(steps)];
+    }
+  }
+  const cap = Number.isFinite(Number(CFG.keyCooldownMs)) && Number(CFG.keyCooldownMs) > 0
+    ? Number(CFG.keyCooldownMs)
+    : steps[steps.length - 1];
+  const clamped = steps.map(v => Math.min(v, cap));
+  if (clamped[clamped.length - 1] < cap) clamped.push(cap);
+  return [...new Set(clamped)];
+}
+
+/**
+ * 按「连续失败次数」取冷却时长。
+ * @param {string} kind 失败类别
+ * @param {number} failures 这是第几次连续失败（从 1 开始）
+ */
+function keyCooldownFor(kind, failures = 1) {
+  const ladder = cooldownLadder();
+  const maxMs = ladder[ladder.length - 1];
+  // 额度耗尽 / 鉴权失效：等 5 分钟没有意义，直接封到最长
+  if (kind === 'quota' || kind === 'auth') return maxMs;
+  const idx = Math.min(Math.max(failures, 1) - 1, ladder.length - 1);
+  return ladder[idx];
 }
 
 // 把上游失败归类，决定冷却时长；同时决定这次失败是否值得换账号重试
 function classifyUpstreamFailure(status, message) {
+  const text = String(message || '');
+  // 权益不足要放在 401/403 之前判断：这类错误常以 403 返回但密钥有效
+  if (KEY_ENTITLEMENT_HINT.test(text)) return 'entitlement';
   if (status === 401 || status === 403) return 'auth';
   if (status === 402) return 'quota';
-  if (status === 429) return KEY_QUOTA_HINT.test(message || '') ? 'quota' : 'rate';
+  if (status === 429) {
+    // 只提限流、没提额度 → 短时限流，走阶梯；否则视为额度耗尽
+    const quotaHit = KEY_QUOTA_HINT.test(text);
+    const rateHit = KEY_RATE_HINT.test(text);
+    return (quotaHit && !rateHit) ? 'quota' : 'rate';
+  }
   if (status >= 500) return 'server';
   if (!status) return 'network';
   return 'other';
@@ -1020,19 +1131,35 @@ function classifyUpstreamFailure(status, message) {
 
 // 只有「换账号可能成功」的错误才做故障转移。400/404/422 是请求本身的问题，
 // 换账号只会浪费一次调用并让报错信息变模糊。
-function isFailoverWorthy(status) {
+// entitlement（套餐不含该模型）同理：换账号也还是同一个套餐限制。
+function isFailoverWorthy(status, message) {
+  if (KEY_ENTITLEMENT_HINT.test(String(message || ''))) return false;
   return status === 401 || status === 403 || status === 402 || status === 429 || status >= 500;
 }
 
 function openKeyBreaker(apiKey, { kind, status, message }) {
-  const cooldownMs = keyCooldownFor(kind);
-  if (!(cooldownMs > 0)) return; // 冷却为 0 表示只转移、不记忆
   const fp = keyFingerprint(apiKey);
   const previous = keyBreaker.get(fp);
+
+  // 权益类问题不该熔断账号，直接返回不动熔断器
+  if (kind === 'entitlement') {
+    log('info', 'Key circuit kept closed (entitlement error, not a key problem)', {
+      key: keyLabel(apiKey),
+      status,
+      message: (message || '').slice(0, 160),
+    });
+    return;
+  }
+
+  // 连续失败计数：同一账号连续失败才升级；已被熔断期间再次失败也继续累加
+  const failures = (previous?.failures || 0) + 1;
+  const cooldownMs = keyCooldownFor(kind, failures);
+  if (!(cooldownMs > 0)) return; // 冷却为 0 表示只转移、不记忆
   keyBreaker.set(fp, {
     until: Date.now() + cooldownMs,
     kind,
     status,
+    failures,
     message: (message || '').slice(0, 200),
     openedAt: Date.now(),
   });
@@ -1040,6 +1167,7 @@ function openKeyBreaker(apiKey, { kind, status, message }) {
     key: keyLabel(apiKey),
     kind,
     status,
+    failures,
     cooldownMs,
     cooldownHuman: cooldownMs >= 3600000 ? `${(cooldownMs / 3600000).toFixed(1)}h` : `${(cooldownMs / 1000).toFixed(0)}s`,
     message: (message || '').slice(0, 160),
@@ -1262,7 +1390,7 @@ async function forwardToCCWithFailover({ body, candidates, incomingHeaders, sign
 
     last = { apiKey, attempts: i + 1, status: response.status, error: mapped };
 
-    if (!isFailoverWorthy(response.status)) {
+    if (!isFailoverWorthy(response.status, message)) {
       log('warn', 'Upstream rejected request (not key-related); not failing over', {
         path, model, status: response.status, key: keyLabel(apiKey),
       });
@@ -1283,7 +1411,7 @@ async function forwardToCCWithFailover({ body, candidates, incomingHeaders, sign
 function failoverToNextKey(candidates, triedKeys, { status, message, path, model }) {
   const kind = classifyUpstreamFailure(status, message);
   openKeyBreaker(triedKeys[triedKeys.length - 1], { kind, status, message });
-  if (!isFailoverWorthy(status)) return null;
+  if (!isFailoverWorthy(status, message)) return null;
   const next = nextKeyCandidate(candidates, triedKeys);
   if (!next) return null;
   log('warn', 'Upstream error before first byte; retrying on next account', {
@@ -1358,7 +1486,7 @@ async function handleChatCompletions(req, res) {
     const retryOnNextAccount = async (status, message) => {
       const kind = classifyUpstreamFailure(status, message);
       openKeyBreaker(triedKeys[triedKeys.length - 1], { kind, status, message });
-      if (!isFailoverWorthy(status)) return false;
+      if (!isFailoverWorthy(status, message)) return false;
       const limit = CFG.maxKeyAttempts > 0 ? CFG.maxKeyAttempts : Infinity;
       if (triedKeys.length >= limit) return false;
       const remaining = keyCandidates.keys.filter(k => !triedKeys.includes(k));
@@ -2229,7 +2357,7 @@ async function handleMessages(req, res) {
     const retryOnNextAccount = async (status, message) => {
       const kind = classifyUpstreamFailure(status, message);
       openKeyBreaker(triedKeys[triedKeys.length - 1], { kind, status, message });
-      if (!isFailoverWorthy(status)) return false;
+      if (!isFailoverWorthy(status, message)) return false;
       const limit = CFG.maxKeyAttempts > 0 ? CFG.maxKeyAttempts : Infinity;
       if (triedKeys.length >= limit) return false;
       const remaining = keyCandidates.keys.filter(k => !triedKeys.includes(k));
@@ -2648,7 +2776,7 @@ async function handleModels(req, res) {
       lastError = e;
       const status = e instanceof ModelsUpstreamError ? e.status : 502;
       // 只有「换账号可能成功」的错误才继续尝试下一个账号
-      if (!isFailoverWorthy(status) || i === limit - 1) break;
+      if (!isFailoverWorthy(status, e.message) || i === limit - 1) break;
       openKeyBreaker(apiKey, {
         kind: classifyUpstreamFailure(status, e.message),
         status,

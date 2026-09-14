@@ -62,8 +62,9 @@ commandcode/
 | `apiKeyFiles` | `[]` | Additional credential files, read after `apiKeyFile` (string or array). Useful for keeping a second account in a file the proxy owns |
 | `apiKeys` | `[]` | Ordered list of account keys; takes precedence over `apiKey` / `apiKeyFile`. Duplicates are collapsed |
 | `keyFailover` | `true` | Automatically try the next account when one is exhausted or failing |
-| `keyCooldownMs` | `604800000` | Cooldown for quota/auth failures (1 week — matches a weekly cap reset) |
-| `keyShortCooldownMs` | `60000` | Cooldown for transient failures (`429` rate limit, `5xx`, network) |
+| `keyCooldownLadderMs` | `[5m,1h,12h,24h,1w]` | **Escalating cooldown ladder**: each consecutive failure steps up; any success resets it |
+| `keyCooldownMs` | `604800000` | Cooldown cap (1 week). Quota exhaustion / auth failure jump straight here |
+| `keyShortCooldownMs` | `300000` | Legacy: first rung when `keyCooldownLadderMs` is unset (5 minutes) |
 | `keyStateFile` | `""` | Where breaker state is persisted (default `<proxy dir>/.key-health.json`). Only SHA-256 fingerprints are stored |
 | `maxKeyAttempts` | `0` | Max accounts tried per request (`0` = try every candidate) |
 | `useProviderModels` | `true` | Dynamically fetch model list from Provider API |
@@ -75,14 +76,41 @@ commandcode/
 A pool of CommandCode account keys is tried in order; when one runs out of quota
 it is parked and the next one takes over with no client-visible difference.
 
+> #### ⚠️ Keep real keys in `config.local.json` (important)
+>
+> `config.json` is the **committed template** — leave `"apiKeys": []` there. Put real keys in
+> **`config.local.json`** in the same directory: it is already in `.gitignore`, so **it is never
+> committed and never leaked**.
+>
+> ```bash
+> cp config.local.example.json config.local.json
+> # then edit config.local.json and fill in your real keys
+> ```
+>
+> ```jsonc
+> // config.local.json — secrets only; overrides matching top-level keys
+> {
+>   "apiKeys": ["user_real_key_1", "user_real_key_2"]
+> }
+> ```
+>
+> Precedence: **env vars > `config.local.json` > `config.json` > built-in defaults**.
+> Arrays such as `apiKeys` are **replaced wholesale**, not merged.
+>
+> Verify nothing can leak:
+>
+> ```bash
+> git check-ignore -v config.local.json   # prints the matching .gitignore line
+> grep -rl "user_yourkeyprefix" . --exclude-dir=node_modules --exclude-dir=.git
+> # expect only ./config.local.json
+> ```
+
 ```jsonc
-// config.json — non-secret settings. The key values themselves are better kept
-// in the protected credential file (see apiKeyFile) so they stay out of the repo.
+// config.json — safe to commit (no secrets)
 {
-  "apiKeys": ["user_aaaaaaaa", "user_bbbbbbbb"],
+  "apiKeys": [],
   "keyFailover": true,
-  "keyCooldownMs": 604800000,     // 1 week: quota exhausted / invalid key
-  "keyShortCooldownMs": 60000     // 60s: rate limit, 5xx, network errors
+  "keyCooldownLadderMs": [300000, 3600000, 43200000, 86400000, 604800000]
 }
 ```
 
@@ -108,10 +136,34 @@ in a separate file and list it as well — the keys are concatenated in order:
 
 How failures are classified:
 
-| Upstream result | Cooldown | Fails over |
-|---|---|---|
-| `402` payment required, quota/balance wording in a `429`, `401`/`403` | `keyCooldownMs` (1 week) | yes |
-| `429` rate limit, `5xx`, connection reset, timeout | `keyShortCooldownMs` (60s) | yes |
+#### Escalating cooldown
+
+Consecutive failures on the same account step the cooldown up; **any success resets it to zero**:
+
+| Consecutive failure | Cooldown |
+|---|---|
+| 1 | 5 minutes |
+| 2 | 1 hour |
+| 3 | 12 hours |
+| 4 | 24 hours |
+| 5 and later | **1 week (cap)** |
+
+**Quota exhaustion and auth failure skip the ladder and jump straight to one week**, because retrying
+before the quota resets is pointless. Customise the rungs with `keyCooldownLadderMs`.
+
+| Upstream result | Class | Cooldown | Fails over |
+|---|---|---|---|
+| `402` payment required, quota/balance wording in a `429` | `quota` | **straight to 1 week** | yes |
+| `401` / `403` | `auth` | **straight to 1 week** | yes |
+| `429` rate limit, `5xx`, connection reset, timeout, zero output | `rate`/`server`/`network` | ladder 5m→1h→12h→24h→1w | yes |
+| `403` whose body says the model is not in the plan (e.g. `MODEL_NOT_IN_PLAN`) | `entitlement` | **none** | **no** |
+
+> **Why `entitlement` is separate**: a model outside your plan often returns `403` even though the key
+> is perfectly valid. Treating it as `auth` would break a healthy account for a week and take working
+> models down with it. The proxy reads the response body to recognise this and keeps the account usable.
+>
+> The failure counter is persisted alongside the breaker state, so restarting the proxy does not drop
+> an account that had already escalated back to the first rung.
 | `400`, `404`, `422` (the request itself is wrong) | none | **no** |
 
 Failover only happens before the first byte reaches the client. Once a response
@@ -140,7 +192,10 @@ is cooling the pool is still probed in order rather than deadlocking.
 | `CC_API_KEY_FILES` | `apiKeyFiles` (comma separated) |
 | `CC_KEY_FAILOVER` | `keyFailover` (`false` to disable) |
 | `CC_KEY_COOLDOWN_MS` | `keyCooldownMs` |
+| `CC_KEY_COOLDOWN_LADDER_MS` | `keyCooldownLadderMs` (comma-separated ms) |
 | `CC_KEY_SHORT_COOLDOWN_MS` | `keyShortCooldownMs` |
+| `CC_CONFIG` | Config file path (default `<proxy dir>/config.json`) |
+| `CC_CONFIG_LOCAL` | Secret override path (default `config.local.json` beside config.json) |
 | `CC_KEY_STATE_FILE` | `keyStateFile` |
 | `CC_MAX_KEY_ATTEMPTS` | `maxKeyAttempts` |
 | `CC_USE_PROVIDER_MODELS` | `useProviderModels` |

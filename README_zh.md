@@ -62,8 +62,9 @@ commandcode/
 | `apiKeyFiles` | `[]` | 额外的凭据文件，在 `apiKeyFile` 之后读取（字符串或数组）。适合把第二个账号放在代理自己拥有的文件里 |
 | `apiKeys` | `[]` | 有序账号密钥列表；设置后优先于 `apiKey` / `apiKeyFile`。重复项会自动去重 |
 | `keyFailover` | `true` | 某个账号额度耗尽或报错时自动切换到下一个账号 |
-| `keyCooldownMs` | `604800000` | 额度/鉴权类失败的冷却时长（1 周，对应每周限额重置周期） |
-| `keyShortCooldownMs` | `60000` | 瞬时类失败的冷却时长（`429` 限流、`5xx`、网络错误） |
+| `keyCooldownLadderMs` | `[5m,1h,12h,24h,1w]` | **阶梯冷却**：连续失败逐级升级，任意一次成功即清零 |
+| `keyCooldownMs` | `604800000` | 冷却上限（1 周）。额度耗尽/鉴权失效直接跳到这一级 |
+| `keyShortCooldownMs` | `300000` | 兼容旧配置：未设 `keyCooldownLadderMs` 时作为阶梯首级（默认 5 分钟） |
 | `keyStateFile` | `""` | 熔断状态落盘路径（默认 `<代理目录>/.key-health.json`）。只写入 SHA-256 指纹，不写明文密钥 |
 | `maxKeyAttempts` | `0` | 单个请求最多尝试几个账号（`0` = 试完所有候选） |
 | `useProviderModels` | `true` | 从 Provider API 动态拉取模型列表 |
@@ -75,14 +76,40 @@ commandcode/
 代理按顺序使用密钥池中的账号；某个账号额度用完后会被熔断，由下一个账号接管，
 客户端完全无感知，不需要人工切换。
 
+> #### ⚠️ 真实密钥请放在 `config.local.json`（重要）
+>
+> `config.json` 是**提交到 Git 的模板**，请只留 `"apiKeys": []`。真实密钥写到同目录的
+> **`config.local.json`** —— 它已在 `.gitignore` 里，**不会被提交、不会泄露**。
+>
+> ```bash
+> cp config.local.example.json config.local.json
+> # 然后编辑 config.local.json，填入真实密钥
+> ```
+>
+> ```jsonc
+> // config.local.json —— 只放私密内容，覆盖 config.json 的同名顶层字段
+> {
+>   "apiKeys": ["user_真实key1", "user_真实key2"]
+> }
+> ```
+>
+> 加载优先级：**环境变量 > `config.local.json` > `config.json` > 内置默认值**。
+> `apiKeys` 这类数组是**整体替换**而非追加合并。
+>
+> 确认不会泄露：
+>
+> ```bash
+> git check-ignore -v config.local.json    # 应输出 .gitignore 中匹配的行
+> grep -rl "user_你的key前缀" . --exclude-dir=node_modules --exclude-dir=.git
+> # 期望只列出 ./config.local.json
+> ```
+
 ```jsonc
-// config.json —— 只放非敏感配置。密钥本身建议放在受保护的凭据文件里，
-// 这样不会进入仓库（见 apiKeyFile）。
+// config.json —— 可安全提交（不含任何密钥）
 {
-  "apiKeys": ["user_aaaaaaaa", "user_bbbbbbbb"],
+  "apiKeys": [],
   "keyFailover": true,
-  "keyCooldownMs": 604800000,     // 1 周：额度耗尽 / 密钥失效
-  "keyShortCooldownMs": 60000     // 60s：限流、5xx、网络错误
+  "keyCooldownLadderMs": [300000, 3600000, 43200000, 86400000, 604800000]
 }
 ```
 
@@ -106,13 +133,36 @@ refs:
 }
 ```
 
+#### 阶梯冷却
+
+同一个账号**连续失败**时冷却逐级升级，**任意一次成功立即清零**：
+
+| 连续第几次失败 | 冷却时长 |
+|---|---|
+| 1 | 5 分钟 |
+| 2 | 1 小时 |
+| 3 | 12 小时 |
+| 4 | 24 小时 |
+| 5 及以后 | **1 周（封顶）** |
+
+**额度耗尽（周额度用尽）与鉴权失效不走阶梯，直接跳到 1 周** —— 这两类在重置前重试没有意义。
+可用 `keyCooldownLadderMs` 自定义各级时长。
+
 失败分类规则：
 
-| 上游返回 | 冷却时长 | 是否切换账号 |
-|---|---|---|
-| `402` 需要付费、`429` 且文案含额度/余额字样、`401`/`403` | `keyCooldownMs`（1 周） | 是 |
-| `429` 限流、`5xx`、连接被重置、超时 | `keyShortCooldownMs`（60秒） | 是 |
-| `400`、`404`、`422`（请求本身有问题） | 不冷却 | **否** |
+| 上游返回 | 归类 | 冷却 | 是否切换账号 |
+|---|---|---|---|
+| `402`、`429` 且文案含额度/余额字样 | `quota` | **直接 1 周** | 是 |
+| `401`、`403` | `auth` | **直接 1 周** | 是 |
+| `429` 限流、`5xx`、连接被重置、超时、零输出 | `rate`/`server`/`network` | 走阶梯 5m→1h→12h→24h→1w | 是 |
+| `400`、`404`、`422`（请求本身有问题） | `other` | 不冷却 | **否** |
+| `403` 且文案为套餐不含该模型（如 `MODEL_NOT_IN_PLAN`） | `entitlement` | **不冷却** | **否** |
+
+> **为什么单列 `entitlement`**：套餐不含某个模型时常以 `403` 返回，但密钥完全有效。
+> 若按 `auth` 处理会把好账号熔断一周，连本来能用的模型也一起不可用。代理按响应体文案识别
+> 这类错误并保持账号可用。
+>
+> 冷却计数会随熔断状态一起持久化：重启代理不会让「已升到第 4 级」的账号退回 5 分钟。
 
 故障转移只在「首字节尚未发给客户端」时进行。响应一旦开始流式输出就无法收回，
 此时会把上游错误如实透传而不是重试 —— 避免重复输出与重复计费。同一条规则让
@@ -137,7 +187,10 @@ refs:
 | `CC_API_KEY_FILES` | `apiKeyFiles`（逗号分隔） |
 | `CC_KEY_FAILOVER` | `keyFailover`（`false` 关闭） |
 | `CC_KEY_COOLDOWN_MS` | `keyCooldownMs` |
+| `CC_KEY_COOLDOWN_LADDER_MS` | `keyCooldownLadderMs`（逗号分隔毫秒，如 `300000,3600000,604800000`） |
 | `CC_KEY_SHORT_COOLDOWN_MS` | `keyShortCooldownMs` |
+| `CC_CONFIG_LOCAL` | 私密覆盖文件路径（默认与 config.json 同目录的 `config.local.json`） |
+| `CC_CONFIG` | 配置文件路径（默认 `<代理目录>/config.json`） |
 | `CC_KEY_STATE_FILE` | `keyStateFile` |
 | `CC_MAX_KEY_ATTEMPTS` | `maxKeyAttempts` |
 | `CC_USE_PROVIDER_MODELS` | `useProviderModels` |
