@@ -42,7 +42,7 @@ echo "== 1) DSH settings.yaml =="
 # DSH must not forward a stale upstream account key. The proxy selects from
 # config.local.json and needs a marker value so loopback requests use that pool.
 for profile in "$HOME_DIR/.dsh/profiles/web/cordis.patch.yml" "$HOME_DIR/.dsh/profiles/sdk/cordis.patch.yml" "$HOME_DIR/.dsh/profiles/headless/cordis.patch.yml" "$HOME_DIR/.dsh/profiles/desktop/cordis.patch.yml"; do
-  [ -f "$profile" ] && sed -i '' '/^[[:space:]]*apiKeyEnv: CC_DEEPSEEK_API_KEY$/d' "$profile"
+  [ -f "$profile" ] && sed -i '' 's/apiKeyEnv: \(CC_DEEPSEEK_API_KEY\|PROXY_MANAGED\)/apiKeyEnv: CC_PROXY_API_KEY/' "$profile"
 done
 backup "$DSH_SETTINGS"
 python3 - "$DSH_SETTINGS" <<'PY'
