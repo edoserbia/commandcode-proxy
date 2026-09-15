@@ -1114,6 +1114,9 @@ function keyCooldownFor(kind, failures = 1) {
 // 把上游失败归类，决定冷却时长；同时决定这次失败是否值得换账号重试
 function classifyUpstreamFailure(status, message) {
   const text = String(message || '');
+  // A 429 usage/weekly limit is account quota exhaustion, even when the
+  // provider text also mentions the plan. It must fail over to another key.
+  if (status === 429 && KEY_QUOTA_HINT.test(text) && !KEY_RATE_HINT.test(text)) return 'quota';
   // 权益不足要放在 401/403 之前判断：这类错误常以 403 返回但密钥有效
   if (KEY_ENTITLEMENT_HINT.test(text)) return 'entitlement';
   if (status === 401 || status === 403) return 'auth';
@@ -1133,6 +1136,7 @@ function classifyUpstreamFailure(status, message) {
 // 换账号只会浪费一次调用并让报错信息变模糊。
 // entitlement（套餐不含该模型）同理：换账号也还是同一个套餐限制。
 function isFailoverWorthy(status, message) {
+  if (status === 429 && KEY_QUOTA_HINT.test(String(message || '')) && !KEY_RATE_HINT.test(String(message || ''))) return true;
   if (KEY_ENTITLEMENT_HINT.test(String(message || ''))) return false;
   return status === 401 || status === 403 || status === 402 || status === 429 || status >= 500;
 }
