@@ -1131,6 +1131,9 @@ function keyCooldownFor(kind, failures = 1) {
 // 把上游失败归类，决定冷却时长；同时决定这次失败是否值得换账号重试
 function classifyUpstreamFailure(status, message) {
   const text = String(message || '');
+  // A 429 usage/weekly limit is account quota exhaustion, even when the
+  // provider text also mentions the plan. It must fail over to another key.
+  if (status === 429 && KEY_QUOTA_HINT.test(text) && !KEY_RATE_HINT.test(text)) return 'quota';
   // 权益不足要放在 401/403 之前判断：这类错误常以 403 返回但密钥有效
   if (KEY_ENTITLEMENT_HINT.test(text)) return 'entitlement';
   if (status === 401 || status === 403) return 'auth';
@@ -1157,10 +1160,11 @@ function classifyUpstreamFailure(status, message) {
 // entitlement（套餐不含该模型）同理：换账号也还是同一个套餐限制。
 function isFailoverWorthy(status, message) {
   const text = String(message || '');
-  if (KEY_ENTITLEMENT_HINT.test(text)) return false;
-  // 例外：400 携带额度/积分耗尽文案时，问题在账号而不在请求 —— 换账号能成功。
-  // （CC 对「积分用尽」返回 400 而非 402，只看状态码会漏掉这个可转移的场景。）
+  // 额度/积分耗尽优先于 entitlement 判定：周额度耗尽的文案里常带 "upgrade your plan"，
+  // 若先过 entitlement 会被误判成「套餐不含该模型」而不做故障转移。
+  // 同时不限定状态码 —— CC 对积分耗尽用 400、对周额度用 429，两种都要能转移。
   if (KEY_QUOTA_HINT.test(text) && !KEY_RATE_HINT.test(text)) return true;
+  if (KEY_ENTITLEMENT_HINT.test(text)) return false;
   return status === 401 || status === 403 || status === 402 || status === 429 || status >= 500;
 }
 
