@@ -977,7 +977,7 @@ const KEY_QUOTA_HINT = /quota|exceed|insufficient|balance|credit|payment|limit r
 // 这类错误常以 403 返回，但密钥完全有效 —— 若当成 auth 处理会把好账号熔断掉，
 // 连本来能用的模型也一起不可用。典型文案：
 //   MODEL_NOT_IN_PLAN: Claude Sonnet 4.6 available in Pro and above plans
-const KEY_ENTITLEMENT_HINT = /model_not_in_plan|not in (your )?plan|(available|included) in .{0,24}plans?|upgrade (your )?(plan|subscription)|requires? (a )?(pro|max|higher|paid)|plan (does not|doesn't) include|not entitled|套餐|升级|订阅/i;
+const KEY_ENTITLEMENT_HINT = /model_not_in_plan|not in (your )?plan|(available|included) in .{0,24}plans?|requires? (a )?(pro|max|higher|paid)|plan (does not|doesn't) include|not entitled|套餐|订阅/i;
 
 // 短时限流的信号词：用于避免 "rate limit ... reset" 被误判成额度耗尽
 const KEY_RATE_HINT = /rate ?limit|too many requests|slow down|try again (later|in)|请求(过于)?频繁|限流/i;
@@ -1005,19 +1005,31 @@ function loadKeyBreakerState() {
     const data = JSON.parse(readFileSync(path, 'utf-8'));
     const now = Date.now();
     let loaded = 0;
+    let reclassified = 0;
     for (const [fp, entry] of Object.entries(data?.breakers || {})) {
       if (!entry || typeof entry.until !== 'number') continue;
       const failures = Number(entry.failures) || 0;
+      const message = typeof entry.message === 'string' ? entry.message.slice(0, 200) : '';
+      const status = entry.status ?? 0;
+      // 早期版本会把「积分耗尽」的 400 记成 kind:"other"，导致重启后这个账号
+      // 不再被认定为硬冷却、又能被当兜底候选使用。这里按留存的 status+message
+      // 重新判定一次，让历史状态也能享受修正后的分类。
+      let kind = entry.kind || 'unknown';
+      const derived = classifyUpstreamFailure(status, message);
+      if (derived !== kind && (derived === 'quota' || derived === 'auth')) {
+        kind = derived;
+        reclassified++;
+      }
       if (entry.until <= now) {
         // 冷却已过期 → 账号恢复可用，但「连续失败次数」必须保留，
         // 否则重启后阶梯会退回第一级，永远升不上去。
         if (failures > 0) {
           keyBreaker.set(fp, {
             until: 0,
-            kind: entry.kind || 'unknown',
-            status: entry.status ?? 0,
+            kind,
+            status,
             failures,
-            message: typeof entry.message === 'string' ? entry.message.slice(0, 200) : '',
+            message,
             openedAt: entry.openedAt || now,
           });
           loaded++;
@@ -1026,15 +1038,20 @@ function loadKeyBreakerState() {
       }
       keyBreaker.set(fp, {
         until: entry.until,
-        kind: entry.kind || 'unknown',
-        status: entry.status ?? 0,
+        kind,
+        status,
         failures,
-        message: typeof entry.message === 'string' ? entry.message.slice(0, 200) : '',
+        message,
         openedAt: entry.openedAt || now,
       });
       loaded++;
     }
-    if (loaded) log('info', 'Restored key breaker state', { cooling: loaded, path });
+    if (loaded) {
+      log('info', 'Restored key breaker state', { cooling: loaded, reclassified, path });
+      // 重新分类过的条目要写回磁盘，否则文件里一直留着旧的 kind:"other"，
+      // 每次重启都依赖这次即时修正（虽然结果一致，但排查时容易误判）。
+      if (reclassified) persistKeyBreakerState();
+    }
   } catch (e) {
     log('warn', 'Key breaker state could not be read; starting fresh', { error: e.message });
   }
@@ -1126,6 +1143,12 @@ function classifyUpstreamFailure(status, message) {
   }
   if (status >= 500) return 'server';
   if (!status) return 'network';
+  // 额度耗尽并不总是用 402/429 表达：CC 也会把「积分/额度用尽」塞进 400，文案是
+  // "You have insufficient credits to make this request..."。若按 other 归类，它会走
+  // 普通阶梯（首级只有 5 分钟），且不算 failover 理由 —— 结果是每次都在同一个空账号上
+  // 白白失败一次，还把它的冷却反复延长。这里按文案兜底识别，配合 isFailoverWorthy
+  // 一起放行，才能真正切到还有额度的账号。
+  if (KEY_QUOTA_HINT.test(text) && !KEY_RATE_HINT.test(text)) return 'quota';
   return 'other';
 }
 
@@ -1133,7 +1156,11 @@ function classifyUpstreamFailure(status, message) {
 // 换账号只会浪费一次调用并让报错信息变模糊。
 // entitlement（套餐不含该模型）同理：换账号也还是同一个套餐限制。
 function isFailoverWorthy(status, message) {
-  if (KEY_ENTITLEMENT_HINT.test(String(message || ''))) return false;
+  const text = String(message || '');
+  if (KEY_ENTITLEMENT_HINT.test(text)) return false;
+  // 例外：400 携带额度/积分耗尽文案时，问题在账号而不在请求 —— 换账号能成功。
+  // （CC 对「积分用尽」返回 400 而非 402，只看状态码会漏掉这个可转移的场景。）
+  if (KEY_QUOTA_HINT.test(text) && !KEY_RATE_HINT.test(text)) return true;
   return status === 401 || status === 403 || status === 402 || status === 429 || status >= 500;
 }
 
@@ -1189,14 +1216,29 @@ function keyCoolingRemainingMs(apiKey, now = Date.now()) {
   return Math.max(0, entry.until - now);
 }
 
+// 额度耗尽 / 鉴权失败属于「短期内不会自愈」：冷却期内再打过去必然还是同一个错误。
+// 这类账号不允许被当作故障转移的兜底候选 —— 否则备用账号每次抖动（上游限流、网络
+// 抖动）都会把请求丢回一个空账号，用户就会反复看到「额度不足」，而这一周冷却形同虚设。
+function keyKind(apiKey) {
+  return keyBreaker.get(keyFingerprint(apiKey))?.kind || '';
+}
+
+function isHardCooled(apiKey, now = Date.now()) {
+  if (!(keyCoolingRemainingMs(apiKey, now) > 0)) return false;
+  const kind = keyKind(apiKey);
+  return kind === 'quota' || kind === 'auth';
+}
+
 // 健康账号按配置顺序排在前面；已熔断的账号降级排在最后，
 // 仅在健康账号全部失败时才会被当作「half-open 探针」试用 —— 这样既避免
 // 反复撞已知失败的账号，又不会在所有账号都熔断时彻底锁死。
+// 例外：额度/鉴权类硬冷却账号连探针资格也没有，直接剔除。
 function orderKeysByHealth(keys) {
   const now = Date.now();
   const healthy = [];
   const cooling = [];
   for (const k of keys) {
+    if (isHardCooled(k, now)) continue; // 硬冷却：冷却期内不可能成功，不占用候选位
     const remaining = keyCoolingRemainingMs(k, now);
     if (remaining > 0) cooling.push({ key: k, until: now + remaining });
     else healthy.push(k);
@@ -1287,7 +1329,12 @@ function resolveKeyCandidates(headers, allowConfigured = false) {
   const pool = getConfiguredApiKeys();
   if (!pool.length) return { keys: [], source: 'none' };
   if (!CFG.keyFailover) return { keys: [pool[0]], source: 'configured-single' };
-  return { keys: orderKeysByHealth(pool), source: 'configured' };
+  const ordered = orderKeysByHealth(pool);
+  // 兜底：整个池子都在硬冷却（例如只有一个账号且额度已耗尽）时不能返回空候选 ——
+  // 那会退化成 401「缺少密钥」，把「额度不足」这个真实原因藏起来。宁可照常发一次
+  // 请求、把上游的真实错误原样透传，也不要给出误导性的报错。
+  if (!ordered.length) return { keys: [...pool], source: 'configured-all-cooling' };
+  return { keys: ordered, source: 'configured' };
 }
 
 // 取「下一个还没试过的账号」用于请求中途（尚未写出任何字节时）的重新尝试。
@@ -1338,11 +1385,23 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCac
 // 只在这里做「拿响应」阶段的转移 —— 此时还没有任何字节写回客户端，切换账号
 // 对下游完全透明。
 async function forwardToCCWithFailover({ body, candidates, incomingHeaders, signal, promptCacheKey, path, model }) {
-  const limit = CFG.maxKeyAttempts > 0 ? Math.min(CFG.maxKeyAttempts, candidates.length) : candidates.length;
+  // 硬冷却（额度耗尽/鉴权失败）的账号在冷却期内必然复现同一个错误，先把它们剔掉：
+  // 既省掉一次注定失败的上游调用，也不会再刷一条误导性的「额度不足」。
+  // 候选由本函数内部产生时（retryOnNextAccount 传入的 remaining）也一并过这道滤网。
+  const usable = candidates.filter(k => !isHardCooled(k));
+  if (usable.length !== candidates.length) {
+    log('info', 'Hard-cooled accounts removed from candidates', {
+      path, model, dropped: candidates.length - usable.length, kept: usable.length,
+    });
+  }
+  // 全部都在硬冷却 → 退回原候选：宁可照常发一次请求、把上游的真实错误原样透传，
+  // 也不要报「没有可用账号」这种掩盖真实原因的错误。
+  const list = usable.length ? usable : candidates;
+  const limit = CFG.maxKeyAttempts > 0 ? Math.min(CFG.maxKeyAttempts, list.length) : list.length;
   let last = null;
 
   for (let i = 0; i < limit; i++) {
-    const apiKey = candidates[i];
+    const apiKey = list[i];
 
     // 客户端已断连就别再浪费上游调用
     if (signal?.aborted) {
@@ -1489,7 +1548,9 @@ async function handleChatCompletions(req, res) {
       if (!isFailoverWorthy(status, message)) return false;
       const limit = CFG.maxKeyAttempts > 0 ? CFG.maxKeyAttempts : Infinity;
       if (triedKeys.length >= limit) return false;
-      const remaining = keyCandidates.keys.filter(k => !triedKeys.includes(k));
+      // 排除已试过的账号，以及硬冷却（额度/鉴权）账号 —— 后者正是「主账号明明
+      // 已经冷却，却还在备用账号抖动时被拉回来用」的漏点。
+      const remaining = keyCandidates.keys.filter(k => !triedKeys.includes(k) && !isHardCooled(k));
       if (!remaining.length) return false;
 
       log('warn', 'Upstream error before first byte; retrying on next account', {
@@ -2360,7 +2421,8 @@ async function handleMessages(req, res) {
       if (!isFailoverWorthy(status, message)) return false;
       const limit = CFG.maxKeyAttempts > 0 ? CFG.maxKeyAttempts : Infinity;
       if (triedKeys.length >= limit) return false;
-      const remaining = keyCandidates.keys.filter(k => !triedKeys.includes(k));
+      // 同上：硬冷却账号不得作为兜底候选
+      const remaining = keyCandidates.keys.filter(k => !triedKeys.includes(k) && !isHardCooled(k));
       if (!remaining.length) return false;
 
       log('warn', 'Upstream error before first byte; retrying on next account', {
@@ -2762,11 +2824,14 @@ async function handleModels(req, res) {
     return;
   }
 
-  // 模型列表也是账号级接口：某个账号额度耗尽时同样自动切换
+  // 模型列表也是账号级接口：某个账号额度耗尽时同样自动切换。
+  // 硬冷却账号先剔掉（除非整个池子都在冷却 —— 那样至少让它试一次，好把真实错误透传）。
+  const usableKeys = keys.filter(k => !isHardCooled(k));
+  const orderedKeys = usableKeys.length ? usableKeys : keys;
   let lastError = null;
-  const limit = CFG.maxKeyAttempts > 0 ? Math.min(CFG.maxKeyAttempts, keys.length) : keys.length;
+  const limit = CFG.maxKeyAttempts > 0 ? Math.min(CFG.maxKeyAttempts, orderedKeys.length) : orderedKeys.length;
   for (let i = 0; i < limit; i++) {
-    const apiKey = keys[i];
+    const apiKey = orderedKeys[i];
     try {
       const models = await fetchModels(apiKey);
       closeKeyBreaker(apiKey);
@@ -2892,10 +2957,11 @@ server.listen(CFG.port, CFG.host, () => {
       if (!pool.length) return 'none configured (client must send its own key)';
       if (!CFG.keyFailover) return `1 key (failover disabled)`;
       const cooling = pool.filter(k => keyCoolingRemainingMs(k) > 0).length;
+      const hard = pool.filter(k => isHardCooled(k)).length;
       const longH = (CFG.keyCooldownMs / 3600000).toFixed(1);
       const shortS = Math.round(CFG.keyShortCooldownMs / 1000);
       return `${pool.length} key(s), ${pool.length - cooling} ready / ${cooling} cooling` +
-        ` (quota+auth cooldown ${longH}h, transient ${shortS}s)`;
+        ` (${hard} unusable: quota/auth; quota+auth cooldown ${longH}h, transient ${shortS}s)`;
     })(),
   });
   if (CLIENT_DRAIN_TIMEOUT_MS > 0) {

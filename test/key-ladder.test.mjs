@@ -35,7 +35,7 @@ const WEEK = 7 * 24 * HOUR;
 let upstreamPort = 0;
 
 function createFakeUpstream() {
-  const state = { rule: 'ok', calls: 0 };
+  const state = { rule: 'ok', calls: 0, authSeen: [] };
   const server = http.createServer((req, res) => {
     if (req.url.includes('/fingerprint') || req.url.includes('/lifecycle')) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -48,6 +48,8 @@ function createFakeUpstream() {
       return;
     }
     state.calls++;
+    // 记录这次生成请求实际用的是哪个账号 —— 用于断言「冷却账号有没有被偷用」
+    state.authSeen.push(String(req.headers.authorization || '').replace(/^Bearer\s+/, ''));
     const rule = typeof state.rule === 'function' ? state.rule(state.calls) : state.rule;
     if (rule !== 'ok') {
       res.writeHead(rule.status, { 'Content-Type': 'application/json' });
@@ -130,6 +132,49 @@ function lastCooldownMs(logs) {
   const text = logs.join('');
   const matches = [...text.matchAll(/"cooldownMs":(\d+)/g)];
   return matches.length ? Number(matches[matches.length - 1][1]) : null;
+}
+
+/** 构造一条熔断器持久化状态（键为密钥指纹） */
+function breakerState(entries) {
+  const breakers = {};
+  for (const [key, { kind, status, until, failures = 1, message = 'seeded' }] of entries) {
+    breakers[fingerprint(key)] = {
+      until, kind, status, failures,
+      message, openedAt: Date.now() - 60_000,
+    };
+  }
+  return { version: 1, savedAt: Date.now(), breakers };
+}
+
+/** 起一个可指定账号池与预置熔断状态的代理 */
+async function startProxyWithKeys(keys, { state = null, dirPrefix = 'cc-pool-' } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), dirPrefix));
+  const statePath = join(dir, 'key-health.json');
+  if (state) writeFileSync(statePath, JSON.stringify(state), 'utf-8');
+
+  writeFileSync(join(dir, 'config.json'), JSON.stringify({
+    host: '127.0.0.1',
+    apiBase: `http://127.0.0.1:${upstreamPort}`,
+    apiKeys: keys,
+    keyFailover: true,
+    keyStateFile: statePath,
+  }), 'utf-8');
+
+  const port = await freePort();
+  const child = spawn(process.execPath, [PROXY_PATH], {
+    cwd: dir,
+    env: { ...process.env, PORT: String(port), HOST: '127.0.0.1', CC_CONFIG: join(dir, 'config.json') },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const logs = [];
+  child.stdout.on('data', d => logs.push(d.toString()));
+  child.stderr.on('data', d => logs.push(d.toString()));
+  await waitForHealth(port, child, logs);
+
+  return {
+    port, logs, dir, statePath,
+    stop: () => new Promise(r => { child.once('exit', r); child.kill('SIGKILL'); setTimeout(r, 2000); }),
+  };
 }
 
 test('escalating cooldown ladder end to end', async (t) => {
@@ -313,5 +358,144 @@ test('escalating cooldown ladder end to end', async (t) => {
     fake.state.rule = 'ok';
     const res = await call(port);
     assert.equal(res.status, 200, 'local override must provide a usable key');
+  });
+
+  await t.test('weekly usage limit wording triggers failover', async () => {
+    fake.state.rule = { status: 429, message: "You've reached your weekly usage limit for your plan. Your limit resets tomorrow. Please upgrade your plan to continue." };
+    const dir = mkdtempSync(join(tmpdir(), 'cc-quota-wording-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    writeFileSync(join(dir, 'config.json'), JSON.stringify({
+      host: '127.0.0.1', apiBase: `http://127.0.0.1:${upstreamPort}`,
+      apiKeys: [KEY_A, KEY_B], keyFailover: true,
+      keyStateFile: join(dir, 'key-health.json'),
+    }), 'utf-8');
+    const port = await freePort();
+    const child = spawn(process.execPath, [PROXY_PATH], {
+      cwd: dir, env: { ...process.env, PORT: String(port), HOST: '127.0.0.1', CC_CONFIG: join(dir, 'config.json') },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const logs = [];
+    child.stdout.on('data', d => logs.push(d.toString()));
+    child.stderr.on('data', d => logs.push(d.toString()));
+    await waitForHealth(port, child, logs);
+    t.after(() => new Promise(r => { child.once('exit', r); child.kill('SIGKILL'); setTimeout(r, 2000); }));
+    const before = fake.state.calls;
+    const res = await call(port);
+    assert.equal(res.status, 429);
+    assert.equal(fake.state.calls - before, 2, 'quota response must try the backup account');
+  });
+
+  await t.test('a quota-exhausted account is never used as a failover fallback', async () => {
+    // 复现线上问题：主账号（KEY_A）额度已耗尽并处于一周冷却，备用账号（KEY_B）
+    // 偶发抖动（这里是上游瞬时 503）。代理绝不能把备用账号的抖动转移到仍在冷却的
+    // 主账号上 —— 否则用户会反复看到「额度不足」，而一周冷却形同虚设。
+    const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+    const proxy = await startProxyWithKeys([KEY_A, KEY_B], {
+      dirPrefix: 'cc-fallback-',
+      state: breakerState([
+        [KEY_A, { kind: 'quota', status: 400, until: Date.now() + WEEK_MS, failures: 40 }],
+      ]),
+    });
+    t.after(() => proxy.stop());
+
+    // 备用账号第一次调用成功、第二次瞬时 503 → 会触发「首字节前换账号」重试路径
+    fake.state.rule = (n) => (n % 2 === 1 ? 'ok' : { status: 503, message: 'transient upstream blip' });
+
+    const before = fake.state.calls;
+    await call(proxy.port);
+    await call(proxy.port);
+    const used = fake.state.calls - before;
+
+    // 关键断言：冷却中的主账号一次都不该被调用（按上游实际收到的密钥断言，不看日志文案）
+    const keysUsed = fake.state.authSeen.slice(-used);
+    assert.ok(
+      !keysUsed.includes(KEY_A),
+      `a quota-cooled account must never be tried again while cooling, saw: ${JSON.stringify(keysUsed)}`,
+    );
+    assert.doesNotMatch(proxy.logs.join(''), /insufficient credits/);
+    assert.ok(used >= 2, `backup account should serve the requests, saw ${used} upstream call(s)`);
+  });
+
+  await t.test('legacy "other" quota state is reclassified on restart', async () => {
+    // 历史状态里「积分耗尽」被记成了 kind:"other"（旧版本的 400 分类 bug）。
+    // 重启后必须按留存的 status+message 重新判定为 quota，否则这个账号会重新获得
+    // 兜底候选资格 —— 线上正是这样反复触发「额度不足」的。
+    const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+    const proxy = await startProxyWithKeys([KEY_A, KEY_B], {
+      dirPrefix: 'cc-legacy-',
+      state: breakerState([
+        [KEY_A, {
+          kind: 'other', status: 400, until: Date.now() + WEEK_MS, failures: 40,
+          message: 'You have insufficient credits to make this request. Please purchase more credits to continue using the service.',
+        }],
+      ]),
+    });
+    t.after(() => proxy.stop());
+
+    // 备用账号抖动 → 若不重新分类，请求会被丢回冷却中的主账号
+    fake.state.rule = (n) => (n % 2 === 1 ? 'ok' : { status: 503, message: 'transient upstream blip' });
+
+    const before = fake.state.calls;
+    await call(proxy.port);
+    await call(proxy.port);
+    const keysUsed = fake.state.authSeen.slice(-(fake.state.calls - before));
+
+    assert.match(proxy.logs.join(''), /"reclassified":1/, 'legacy quota state must be reclassified');
+    assert.ok(
+      !keysUsed.includes(KEY_A),
+      `a reclassified quota-cooled account must not be reused, saw: ${JSON.stringify(keysUsed)}`,
+    );
+  });
+
+  await t.test('400 + insufficient credits is classified as quota and fails over', async () => {
+    // CC 用 400（而不是 402/429）表达积分耗尽。这种响应必须被识别为额度问题：
+    // 既直接跳到最长冷却，也要能切到还有额度的账号。
+    fake.state.rule = {
+      status: 400,
+      message: 'You have insufficient credits to make this request. Please purchase more credits to continue using the service.',
+    };
+    const proxy = await startProxyWithKeys([KEY_A, KEY_B], { dirPrefix: 'cc-400quota-' });
+    t.after(() => proxy.stop());
+
+    const before = fake.state.calls;
+    const res = await call(proxy.port);
+    assert.equal(res.status, 400);
+    assert.equal(fake.state.calls - before, 2, 'a credit-exhausted 400 must try the backup account');
+    assert.match(proxy.logs.join(''), /"kind":"quota"/, 'the 400 must be classified as quota');
+    assert.equal(lastCooldownMs(proxy.logs), WEEK, 'quota 400s must jump to the one-week cap');
+  });
+
+  await t.test('a genuine non-credit 400 still does not fail over', async () => {
+    // 反向保护：普通请求类 400（不含量额文案）不该白跑一遍备用账号。
+    fake.state.rule = { status: 400, message: 'messages: field required' };
+    const proxy = await startProxyWithKeys([KEY_A, KEY_B], { dirPrefix: 'cc-400plain-' });
+    t.after(() => proxy.stop());
+
+    const before = fake.state.calls;
+    const res = await call(proxy.port);
+    assert.equal(res.status, 400);
+    assert.equal(fake.state.calls - before, 1, 'an ordinary 400 must not burn the backup account');
+    assert.match(proxy.logs.join(''), /not key-related/);
+  });
+
+  await t.test('when every account is quota-cooled the real error is still surfaced', async () => {
+    // 全池冷却时不能退化成 401「缺少密钥」，必须把上游真实错误透传出来。
+    const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+    fake.state.rule = {
+      status: 400,
+      message: 'You have insufficient credits to make this request. Please purchase more credits to continue using the service.',
+    };
+    const proxy = await startProxyWithKeys([KEY_A, KEY_B], {
+      dirPrefix: 'cc-allcool-',
+      state: breakerState([
+        [KEY_A, { kind: 'quota', status: 400, until: Date.now() + WEEK_MS }],
+        [KEY_B, { kind: 'quota', status: 400, until: Date.now() + WEEK_MS }],
+      ]),
+    });
+    t.after(() => proxy.stop());
+
+    const res = await call(proxy.port);
+    assert.equal(res.status, 400, 'the upstream quota error must reach the client');
+    assert.match(await res.text(), /insufficient credits/);
   });
 });
