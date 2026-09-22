@@ -214,6 +214,8 @@ is cooling the pool is still probed in order rather than deadlocking.
 | `CC_KEY_SHORT_COOLDOWN_MS` | `300000` | Legacy first rung → `keyShortCooldownMs` |
 | `CC_KEY_STATE_FILE` | `<proxy dir>/.key-health.json` | Breaker state path → `keyStateFile` |
 | `CC_MAX_KEY_ATTEMPTS` | `0` (all) | Max accounts tried per request → `maxKeyAttempts` |
+| `CC_KEY_PROBE_MS` | `60000` | Background probe interval; `0` disables the prober → `keyProbeMs` |
+| `CC_KEY_PROBE_MODEL` | *(default)* | Model used by the prober → `keyProbeModel` |
 | `CC_CONFIG_LOCAL` | `config.local.json` | Secret override path (gitignored) |
 
 When enabled, the proxy sends `x-cmd-zdr: 1` on Command Code generation requests
@@ -563,7 +565,8 @@ Aligned line-by-line against the official npm package source (`command-code@1.53
 | **Project Slug** | `x-project-slug` = `slugify(DEVICE_PROFILE.projectDir)` — same source as `config.workingDir` (default `C:\Users\dev\projects\app`, override via `CC_DEVICE_PROJECT_DIR`) |
 | **Single Source of Device Truth** | Fingerprint / `config.environment` / `config.workingDir` / `x-project-slug` / lifecycle `os` all read one `DEVICE_PROFILE` (`win32` / `x64`) — they cannot contradict each other, and the host's real platform, Node version and cwd are never handed upstream |
 | **Reasoning Effort** | `reasoning_effort` pass-through (off/minimal/low/medium/high/xhigh/max) |
-| **Multi-Account Pool** | Ordered `apiKeys`, per-key circuit breaker, escalating cooldown (5m→1h→12h→24h→1w), auto failover on quota/auth/5xx; quota & auth-cooled accounts excluded from failover candidates |
+| **Multi-Account Pool** | Ordered `apiKeys`, per-key circuit breaker, escalating cooldown (5m→1h→12h→24h cap), auto failover on quota/auth/5xx; quota & auth-cooled accounts excluded from failover candidates |
+| **Background Key Probe** | A cooled account that reaches its cooldown is **not** handed back to the pool directly: it enters an *awaiting-probe* state and a background timer verifies it with a minimal generation request (`max_tokens: 1`) before it can serve traffic again. User requests therefore never act as the probe for an unrecovered account. Interval via `keyProbeMs` (**0** disables it and restores the old lazy behaviour; that also removes the cap's ability to shorten a stored cooldown). |
 | **Key Validation** | Regex `user_[a-zA-Z0-9_-]+` on `Authorization: Bearer` or `x-api-key`, auto-cleans extra paths/prefixes, rejects `sk-xxx` format |
 | **Stream Timeout** | 30s streaming / 90s non-streaming → 429 with SDK auto-retry |
 | **Consecutive Timeout** | 3 consecutive timeouts before "reduce context" hint |

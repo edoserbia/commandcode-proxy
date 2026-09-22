@@ -36,13 +36,21 @@ function loadConfig() {
     // ── 多账号密钥池 + 熔断 ──
     apiKeys: [],                  // 有序账号密钥列表；留空则回退到 apiKey / apiKeyFile
     keyFailover: true,            // 是否在账号之间自动故障转移
-    // 阶梯冷却：连续失败逐级升级 5m → 1h → 12h → 24h → 1w，任意一次成功即清零。
+    // 阶梯冷却：连续失败逐级升级 5m → 1h → 12h → 24h，任意一次成功即清零。
     // 额度耗尽 / 鉴权失效直接跳到最长一级（等 5 分钟没有意义）。
-    keyCooldownLadderMs: [5 * 60 * 1000, 60 * 60 * 1000, 12 * 60 * 60 * 1000, 24 * 60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000],
-    keyCooldownMs: 7 * 24 * 60 * 60 * 1000, // 冷却上限（也是额度/鉴权的固定冷却）
+    // 上限默认 24h：配合后台探测（keyProbeMs），账号最快一天内就会被验证并放回，
+    // 没必要再封一周 —— 一周的代价是配额恢复后要等满一周才可能重新用上。
+    keyCooldownLadderMs: [5 * 60 * 1000, 60 * 60 * 1000, 12 * 60 * 60 * 1000, 24 * 60 * 60 * 1000],
+    keyCooldownMs: 24 * 60 * 60 * 1000, // 冷却上限（也是额度/鉴权的固定冷却）
     keyShortCooldownMs: 5 * 60 * 1000,      // 兼容旧配置：阶梯首级（默认 5 分钟）
     keyStateFile: '',             // 熔断状态落盘路径；留空则用 <proxy 目录>/.key-health.json
     maxKeyAttempts: 0,            // 单次请求最多尝试几个账号；0 = 不限（最多试完全部候选）
+    // ── 后台健康探测（把「半开探针」从用户任务里剥离）──
+    // 冷却到期的账号不会立刻回到候选池：先进入「待验证」状态，由后台定时器发一个
+    // 极小请求确认它真的恢复了，成功才关闭熔断。这样用户任务永远只使用已确认健康
+    // 的账号，不会拿真实任务去赌一个可能仍未恢复的账号。0 = 关闭探测（退回旧行为）
+    keyProbeMs: 60 * 1000,        // 扫描「待验证」账号的间隔
+    keyProbeModel: '',            // 探测用模型；留空则用 DEFAULT_PROBE_MODEL
     upstreamProxy: '',            // 上游 HTTP 代理，如 http://127.0.0.1:7890（issue #18）
   };
 
@@ -122,6 +130,12 @@ function loadConfig() {
     if (steps.length > 0) defaults.keyCooldownLadderMs = steps;
   }
   if (process.env.CC_KEY_STATE_FILE) defaults.keyStateFile = process.env.CC_KEY_STATE_FILE;
+  // 后台探测间隔：0 = 关闭（关闭后冷却到期的账号会像以前一样直接回到候选池）
+  if (process.env.CC_KEY_PROBE_MS !== undefined) {
+    const ms = Number.parseInt(process.env.CC_KEY_PROBE_MS, 10);
+    if (Number.isFinite(ms) && ms >= 0) defaults.keyProbeMs = ms;
+  }
+  if (process.env.CC_KEY_PROBE_MODEL) defaults.keyProbeModel = process.env.CC_KEY_PROBE_MODEL;
   if (process.env.CC_MAX_KEY_ATTEMPTS) {
     const n = Number.parseInt(process.env.CC_MAX_KEY_ATTEMPTS, 10);
     if (Number.isFinite(n) && n >= 0) defaults.maxKeyAttempts = n;
@@ -139,7 +153,7 @@ if (!Array.isArray(CFG.apiKeys)) {
   CFG.apiKeys = [];
 }
 CFG.apiKeys = CFG.apiKeys.filter(k => typeof k === 'string' && k.trim()).map(k => k.trim());
-for (const field of ['keyCooldownMs', 'keyShortCooldownMs', 'maxKeyAttempts']) {
+for (const field of ['keyCooldownMs', 'keyShortCooldownMs', 'maxKeyAttempts', 'keyProbeMs']) {
   const n = CFG[field];
   if (typeof n !== 'number' || !Number.isFinite(n) || n < 0) {
     console.error(`[config] ${field} must be a number >= 0; falling back to default`);
@@ -1209,13 +1223,17 @@ function loadKeyBreakerState() {
     const now = Date.now();
     let loaded = 0;
     let reclassified = 0;
+    let clamped = 0;
+    // 冷却上限可能被调小过（例如从「一周」改成 24 小时）。落盘的是绝对时间戳，
+    // 旧文件里残留的超长冷却不会自动缩短 —— 不处理的话，改了配置也要等满一周才生效。
+    const capMs = Number(CFG.keyCooldownMs) > 0 ? Number(CFG.keyCooldownMs) : null;
     for (const [fp, entry] of Object.entries(data?.breakers || {})) {
       if (!entry || typeof entry.until !== 'number') continue;
       const failures = Number(entry.failures) || 0;
       const message = typeof entry.message === 'string' ? entry.message.slice(0, 200) : '';
       const status = entry.status ?? 0;
       // 早期版本会把「积分耗尽」的 400 记成 kind:"other"，导致重启后这个账号
-      // 不再被认定为硬冷却、又能被当兜底候选使用。这里按留存的 status+message
+      // 不再被认定为硬冷却、又能被兜底候选使用。这里按留存的 status+message
       // 重新判定一次，让历史状态也能享受修正后的分类。
       let kind = entry.kind || 'unknown';
       const derived = classifyUpstreamFailure(status, message);
@@ -1223,24 +1241,16 @@ function loadKeyBreakerState() {
         kind = derived;
         reclassified++;
       }
-      if (entry.until <= now) {
-        // 冷却已过期 → 账号恢复可用，但「连续失败次数」必须保留，
-        // 否则重启后阶梯会退回第一级，永远升不上去。
-        if (failures > 0) {
-          keyBreaker.set(fp, {
-            until: 0,
-            kind,
-            status,
-            failures,
-            message,
-            openedAt: entry.openedAt || now,
-          });
-          loaded++;
-        }
-        continue;
+      let until = entry.until;
+      if (capMs && until > now + capMs) {
+        until = now + capMs;
+        clamped++;
       }
+      // 冷却已过期（until<=now）也要保留条目：它代表「待后台探测验证」，
+      // 只有探测成功才会真正 delete 掉。失败计数必须一并保留，否则重启后
+      // 阶梯会退回第一级，永远升不上去。
       keyBreaker.set(fp, {
-        until: entry.until,
+        until,   // 可能已被上面的上限钳制
         kind,
         status,
         failures,
@@ -1250,10 +1260,16 @@ function loadKeyBreakerState() {
       loaded++;
     }
     if (loaded) {
-      log('info', 'Restored key breaker state', { cooling: loaded, reclassified, path });
-      // 重新分类过的条目要写回磁盘，否则文件里一直留着旧的 kind:"other"，
+      log('info', 'Restored key breaker state', {
+        cooling: loaded,
+        reclassified,
+        clampedToCap: clamped,
+        pendingProbe: [...keyBreaker.values()].filter(e => e.until <= now).length,
+        path,
+      });
+      // 重新分类 / 钳制过的条目要写回磁盘，否则文件里一直留着旧值，
       // 每次重启都依赖这次即时修正（虽然结果一致，但排查时容易误判）。
-      if (reclassified) persistKeyBreakerState();
+      if (reclassified || clamped) persistKeyBreakerState();
     }
   } catch (e) {
     log('warn', 'Key breaker state could not be read; starting fresh', { error: e.message });
@@ -1287,12 +1303,10 @@ function persistKeyBreakerState() {
   if (keyPersistTimer.unref) keyPersistTimer.unref();
 }
 
-// 冷却阶梯：连续失败逐级升级，最长一周封顶。
-//   第 1 次 → 5 分钟，第 2 次 → 1 小时，第 3 次 → 12 小时，
-//   第 4 次 → 24 小时，第 5 次及以后 → 一周。
+// 冷却阶梯：连续失败逐级升级 5m → 1h → 12h → 24h，24 小时封顶（见 keyCooldownMs）。
 // 额度/鉴权属于「短期内不会自愈」，直接跳到最长一级；
 // 其余（限流、5xx、网络、零输出）走阶梯。
-const KEY_COOLDOWN_LADDER_MS = [5 * 60 * 1000, 60 * 60 * 1000, 12 * 60 * 60 * 1000, 24 * 60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000];
+const KEY_COOLDOWN_LADDER_MS = [5 * 60 * 1000, 60 * 60 * 1000, 12 * 60 * 60 * 1000, 24 * 60 * 60 * 1000];
 
 function cooldownLadder() {
   const configured = Array.isArray(CFG.keyCooldownLadderMs)
@@ -1436,22 +1450,139 @@ function isHardCooled(apiKey, now = Date.now()) {
   return kind === 'quota' || kind === 'auth';
 }
 
-// 健康账号按配置顺序排在前面；已熔断的账号降级排在最后，
-// 仅在健康账号全部失败时才会被当作「half-open 探针」试用 —— 这样既避免
-// 反复撞已知失败的账号，又不会在所有账号都熔断时彻底锁死。
-// 例外：额度/鉴权类硬冷却账号连探针资格也没有，直接剔除。
+// 冷却已到期、但尚未被后台探测确认的账号 = 「待验证」。
+// 这类账号不再自动回到候选池：以前它一到期就恢复原位置（通常是队首），于是下一个
+// 用户请求就成了它的探针 —— 账号其实还没恢复时，这次请求要么白跑一趟，要么直接把
+// 错误抛给用户。现在改由后台定时器验证，任务只用已确认健康的账号。
+function isPendingProbe(apiKey, now = Date.now()) {
+  // 探测关闭时不存在「等待验证」这回事：没有后台任务会来验证它，
+  // 若仍把它排除在外，账号一旦到期就永远回不到池子里。
+  // 所以关闭探测 = 退回旧行为（冷却到期即视为可用）。
+  if (!(Number(CFG.keyProbeMs) > 0)) return false;
+  const entry = keyBreaker.get(keyFingerprint(apiKey));
+  if (!entry) return false;
+  return entry.until <= now;
+}
+
+// 是否允许在「用户任务」里使用这个账号。
+//   · 待验证（冷却到期但没被探测确认）→ 不允许，交给后台探测
+//   · 额度/鉴权硬冷却（仍在冷却期内）→ 不允许，短期内不可能成功
+//   · 其余瞬态冷却（限流/5xx/网络，仍在冷却期内）→ 允许，作为最后的兜底探针
+//     （它们可能已经恢复，且只在健康账号全部失败后才会被用到）
+function isSelectableForTask(apiKey, now = Date.now()) {
+  if (isPendingProbe(apiKey, now)) return false;
+  if (isHardCooled(apiKey, now)) return false;
+  return true;
+}
+
+// 健康账号按配置顺序排在前面；仍在瞬态冷却中的账号降级排在最后，
+// 仅在健康账号全部失败时才会被当作兜底试用。待验证与硬冷却账号直接剔除。
 function orderKeysByHealth(keys) {
   const now = Date.now();
   const healthy = [];
   const cooling = [];
   for (const k of keys) {
-    if (isHardCooled(k, now)) continue; // 硬冷却：冷却期内不可能成功，不占用候选位
+    if (!isSelectableForTask(k, now)) continue; // 待验证 / 硬冷却：不占用候选位
     const remaining = keyCoolingRemainingMs(k, now);
     if (remaining > 0) cooling.push({ key: k, until: now + remaining });
     else healthy.push(k);
   }
   cooling.sort((a, b) => a.until - b.until); // 最先解冻的优先
   return [...healthy, ...cooling.map(c => c.key)];
+}
+
+// ── 后台健康探测（把半开探针从用户任务里剥离）────────────────
+//
+// 为什么需要它：账号冷却到期后，如果直接让它回到候选池（尤其是回到配置里的首位），
+// 那么下一个用户请求就变成了它的「探针」。账号其实还没恢复时，这次请求要么白跑一趟
+// 再用另一个账号重试，要么在某些路径上直接把探针账号的错误抛给用户 —— 而用户看到的
+// 错误甚至不是健康账号的真实错误。用户任务不该承担这种赌博。
+//
+// 现在的做法：冷却到期 → 进入「待验证」（见 isPendingProbe）→ 后台定时器发一个
+// 极小请求（max_tokens=1）验证 → 成功才关闭熔断放回池子，失败就按类别重新熔断。
+//
+// 探测用「最小生成请求」而不是 /provider/v1/models：后者是元数据端点，额度耗尽时
+// 往往仍返回 200，会把空账号误判成可用。
+const DEFAULT_PROBE_MODEL = 'deepseek/deepseek-v4.1-flash';
+const KEY_PROBE_TIMEOUT_MS = 30 * 1000;
+
+let keyProbeTimer = null;
+let keyProbeInFlight = false;
+
+function probeModel() {
+  return CFG.keyProbeModel || DEFAULT_PROBE_MODEL;
+}
+
+async function probeOneKey(apiKey) {
+  const body = buildCcRequest({
+    model: probeModel(),
+    messages: [{ role: 'user', content: 'ping' }],
+    max_tokens: 1,
+    stream: false,
+  });
+  let response;
+  try {
+    response = await forwardToCC(body, apiKey, {}, AbortSignal.timeout(KEY_PROBE_TIMEOUT_MS));
+  } catch (e) {
+    log('warn', 'Key probe failed (network), keeping account cooling', { key: keyLabel(apiKey), error: e.message });
+    openKeyBreaker(apiKey, { kind: 'network', status: 0, message: `Probe failed: ${e.message}` });
+    return false;
+  }
+
+  const text = await response.text().catch(() => '');
+  if (response.ok) {
+    log('info', 'Key probe succeeded, account back in the pool', { key: keyLabel(apiKey), cooldownWas: keyKind(apiKey) });
+    closeKeyBreaker(apiKey);
+    return true;
+  }
+
+  const mapped = mapCcError(response.status, text);
+  const message = mapped.body?.error?.message || '';
+  const kind = classifyUpstreamFailure(response.status, message);
+  // 套餐不含该模型 ≠ 账号有问题：密钥是好的，放回池子（与 openKeyBreaker 的既有判定一致）
+  if (kind === 'entitlement') {
+    log('info', 'Key probe hit an entitlement error; treating the account as healthy', {
+      key: keyLabel(apiKey), status: response.status, model: probeModel(), message: message.slice(0, 160),
+    });
+    closeKeyBreaker(apiKey);
+    return true;
+  }
+  log('warn', 'Key probe failed, cooldown renewed', {
+    key: keyLabel(apiKey), status: response.status, kind, message: message.slice(0, 160),
+  });
+  openKeyBreaker(apiKey, { kind, status: response.status, message });
+  return false;
+}
+
+// 扫描所有「待验证」账号并逐个探测（串行，避免一次性打爆上游）
+async function probePendingKeys() {
+  if (keyProbeInFlight) return;
+  keyProbeInFlight = true;
+  try {
+    const now = Date.now();
+    const pool = getConfiguredApiKeys();
+    for (const apiKey of pool) {
+      const entry = keyBreaker.get(keyFingerprint(apiKey));
+      if (!entry || entry.until > now) continue; // 不存在=健康；仍在冷却=还没到验证时机
+      await probeOneKey(apiKey);
+    }
+  } catch (e) {
+    log('warn', 'Key prober pass failed', { error: e.message });
+  } finally {
+    keyProbeInFlight = false;
+  }
+}
+
+function startKeyProber() {
+  const interval = Number(CFG.keyProbeMs);
+  if (!Number.isFinite(interval) || interval <= 0) {
+    log('info', 'Key prober disabled; cooldown expiry returns accounts to the pool directly', { keyProbeMs: CFG.keyProbeMs });
+    return;
+  }
+  if (keyProbeTimer) clearInterval(keyProbeTimer);
+  keyProbeTimer = setInterval(() => { probePendingKeys(); }, interval);
+  if (keyProbeTimer.unref) keyProbeTimer.unref(); // 不阻止进程退出（测试/关闭时重要）
+  log('info', 'Key prober started', { intervalMs: interval, model: probeModel() });
 }
 
 // 从凭据文件里读取全部密钥：支持 CC_DEEPSEEK_API_KEY、CC_DEEPSEEK_API_KEY_2、_3 …
@@ -1748,7 +1879,7 @@ async function forwardToCCWithFailover({ body, candidates, incomingHeaders, sign
   // 硬冷却（额度耗尽/鉴权失败）的账号在冷却期内必然复现同一个错误，先把它们剔掉：
   // 既省掉一次注定失败的上游调用，也不会再刷一条误导性的「额度不足」。
   // 候选由本函数内部产生时（retryOnNextAccount 传入的 remaining）也一并过这道滤网。
-  const usable = candidates.filter(k => !isHardCooled(k));
+  const usable = candidates.filter(k => isSelectableForTask(k));
   if (usable.length !== candidates.length) {
     log('info', 'Hard-cooled accounts removed from candidates', {
       path, model, dropped: candidates.length - usable.length, kept: usable.length,
@@ -1912,7 +2043,7 @@ async function handleChatCompletions(req, res) {
       if (triedKeys.length >= limit) return false;
       // 排除已试过的账号，以及硬冷却（额度/鉴权）账号 —— 后者正是「主账号明明
       // 已经冷却，却还在备用账号抖动时被拉回来用」的漏点。
-      const remaining = keyCandidates.keys.filter(k => !triedKeys.includes(k) && !isHardCooled(k));
+      const remaining = keyCandidates.keys.filter(k => !triedKeys.includes(k) && isSelectableForTask(k));
       if (!remaining.length) return false;
 
       log('warn', 'Upstream error before first byte; retrying on next account', {
@@ -2907,7 +3038,7 @@ async function handleMessages(req, res) {
       const limit = CFG.maxKeyAttempts > 0 ? CFG.maxKeyAttempts : Infinity;
       if (triedKeys.length >= limit) return false;
       // 同上：硬冷却账号不得作为兜底候选
-      const remaining = keyCandidates.keys.filter(k => !triedKeys.includes(k) && !isHardCooled(k));
+      const remaining = keyCandidates.keys.filter(k => !triedKeys.includes(k) && isSelectableForTask(k));
       if (!remaining.length) return false;
 
       log('warn', 'Upstream error before first byte; retrying on next account', {
@@ -4079,7 +4210,7 @@ async function handleModels(req, res) {
 
   // 模型列表也是账号级接口：某个账号额度耗尽时同样自动切换。
   // 硬冷却账号先剔掉（除非整个池子都在冷却 —— 那样至少让它试一次，好把真实错误透传）。
-  const usableKeys = keys.filter(k => !isHardCooled(k));
+  const usableKeys = keys.filter(k => isSelectableForTask(k));
   const orderedKeys = usableKeys.length ? usableKeys : keys;
   let lastError = null;
   const limit = CFG.maxKeyAttempts > 0 ? Math.min(CFG.maxKeyAttempts, orderedKeys.length) : orderedKeys.length;
@@ -4194,6 +4325,9 @@ process.on('unhandledRejection', (reason) => {
 // 启动时恢复上次的熔断状态：否则重启会「忘记」某个账号已额度耗尽，
 // 立刻又去撞一次已经失败的账号。
 loadKeyBreakerState();
+// 启动后台探测：把冷却到期账号的验证从用户任务里接管过来。
+// 必须放在 loadKeyBreakerState() 之后 —— 恢复出来的「待验证」账号要能被立刻接手。
+startKeyProber();
 // ── keep-alive 时序（放在反向代理后面时是必调项） ──────────────
 // 反代（nginx/OpenResty）的 upstream keepalive_timeout 必须**小于**这里的值，
 // 否则反代会复用一条后端已经关掉的连接：它把请求体写过去，后端早已 FIN，
@@ -4230,12 +4364,15 @@ server.listen(CFG.port, CFG.host, () => {
       const pool = getConfiguredApiKeys();
       if (!pool.length) return 'none configured (client must send its own key)';
       if (!CFG.keyFailover) return `1 key (failover disabled)`;
-      const cooling = pool.filter(k => keyCoolingRemainingMs(k) > 0).length;
+      // ready = 用户任务真正可以用的账号（不含待验证与硬冷却）
+      const ready = pool.filter(k => isSelectableForTask(k)).length;
+      const pending = pool.filter(k => isPendingProbe(k)).length;
       const hard = pool.filter(k => isHardCooled(k)).length;
       const longH = (CFG.keyCooldownMs / 3600000).toFixed(1);
       const shortS = Math.round(CFG.keyShortCooldownMs / 1000);
-      return `${pool.length} key(s), ${pool.length - cooling} ready / ${cooling} cooling` +
-        ` (${hard} unusable: quota/auth; quota+auth cooldown ${longH}h, transient ${shortS}s)`;
+      const probe = Number(CFG.keyProbeMs) > 0 ? `prober ${Math.round(CFG.keyProbeMs / 1000)}s` : 'prober off';
+      return `${pool.length} key(s), ${ready} ready / ${pending} awaiting probe / ${hard} quota-auth cooled` +
+        ` (cooldown cap ${longH}h, transient ${shortS}s, ${probe})`;
     })(),
     upstreamProxy: redactProxyUrl(UPSTREAM_PROXY),
   });

@@ -10,8 +10,9 @@
 
   "apiKeys": [],
   "keyFailover": true,
-  "keyCooldownLadderMs": [300000, 3600000, 43200000, 86400000, 604800000],
-  "keyCooldownMs": 604800000,
+  "keyCooldownLadderMs": [300000, 3600000, 43200000, 86400000],
+  "keyCooldownMs": 86400000,
+  "keyProbeMs": 60000,
   "maxKeyAttempts": 0,
   "upstreamProxy": ""
 }

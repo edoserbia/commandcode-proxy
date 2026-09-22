@@ -2,7 +2,7 @@
  * 阶梯冷却 + 失败分类的端到端验证。
  *
  * 直接驱动真实 proxy 进程，用假上游注入故障，断言：
- *   - 连续失败按 5m → 1h → 12h → 24h → 1w 逐级升级，且封顶一周
+ *   - 连续失败按 5m → 1h → 12h → 24h 逐级升级，且封顶 24h
  *   - 额度耗尽 / 鉴权失败直接跳到最长冷却
  *   - 权益不足（MODEL_NOT_IN_PLAN 403）不熔断账号
  *   - 一次成功即清零，下次失败重新从 5 分钟开始
@@ -30,12 +30,12 @@ function fingerprint(apiKey) {
 
 const MIN = 60_000;
 const HOUR = 60 * MIN;
-const WEEK = 7 * 24 * HOUR;
+const CAP = 24 * HOUR;   // 冷却上限（配合后台探测，不再封一周）
 
 let upstreamPort = 0;
 
 function createFakeUpstream() {
-  const state = { rule: 'ok', calls: 0, authSeen: [] };
+  const state = { rule: 'ok', perKey: {}, calls: 0, authSeen: [] };
   const server = http.createServer((req, res) => {
     if (req.url.includes('/fingerprint') || req.url.includes('/lifecycle')) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -49,8 +49,12 @@ function createFakeUpstream() {
     }
     state.calls++;
     // 记录这次生成请求实际用的是哪个账号 —— 用于断言「冷却账号有没有被偷用」
-    state.authSeen.push(String(req.headers.authorization || '').replace(/^Bearer\s+/, ''));
-    const rule = typeof state.rule === 'function' ? state.rule(state.calls) : state.rule;
+    const usedKey = String(req.headers.authorization || '').replace(/^Bearer\s+/, '');
+    state.authSeen.push(usedKey);
+    // perKey 优先于全局 rule：便于「某个账号失败、另一个账号健康」的场景
+    const rule = state.perKey[usedKey] !== undefined
+      ? state.perKey[usedKey]
+      : (typeof state.rule === 'function' ? state.rule(state.calls) : state.rule);
     if (rule !== 'ok') {
       res.writeHead(rule.status, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: { message: rule.message } }));
@@ -91,6 +95,7 @@ async function startProxy(extraConfig = {}) {
     keyFailover: true,
     keyStateFile: join(dir, 'key-health.json'),
     maxKeyAttempts: 1,
+    keyProbeMs: 0,
     ...extraConfig,
   }), 'utf-8');
 
@@ -147,7 +152,7 @@ function breakerState(entries) {
 }
 
 /** 起一个可指定账号池与预置熔断状态的代理 */
-async function startProxyWithKeys(keys, { state = null, dirPrefix = 'cc-pool-' } = {}) {
+async function startProxyWithKeys(keys, { state = null, dirPrefix = 'cc-pool-', extraConfig = {} } = {}) {
   const dir = mkdtempSync(join(tmpdir(), dirPrefix));
   const statePath = join(dir, 'key-health.json');
   if (state) writeFileSync(statePath, JSON.stringify(state), 'utf-8');
@@ -158,6 +163,7 @@ async function startProxyWithKeys(keys, { state = null, dirPrefix = 'cc-pool-' }
     apiKeys: keys,
     keyFailover: true,
     keyStateFile: statePath,
+    ...extraConfig,
   }), 'utf-8');
 
   const port = await freePort();
@@ -173,6 +179,10 @@ async function startProxyWithKeys(keys, { state = null, dirPrefix = 'cc-pool-' }
 
   return {
     port, logs, dir, statePath,
+    readState() {
+      if (!existsSync(this.statePath)) return null;
+      return JSON.parse(readFileSync(this.statePath, 'utf-8'));
+    },
     stop: () => new Promise(r => { child.once('exit', r); child.kill('SIGKILL'); setTimeout(r, 2000); }),
   };
 }
@@ -182,13 +192,13 @@ test('escalating cooldown ladder end to end', async (t) => {
   upstreamPort = await new Promise(r => fake.server.listen(0, '127.0.0.1', () => r(fake.server.address().port)));
   t.after(() => fake.server.close());
 
-  await t.test('repeated failures escalate 5m -> 1h -> 12h -> 24h -> 1w', async () => {
+  await t.test('repeated failures escalate 5m -> 1h -> 12h -> 24h (cap)', async () => {
     fake.state.rule = { status: 503, message: 'upstream unavailable' };
     const dir = mkdtempSync(join(tmpdir(), 'cc-esc-'));
     t.after(() => rmSync(dir, { recursive: true, force: true }));
     const statePath = join(dir, 'key-health.json');
 
-    const expected = [5 * MIN, HOUR, 12 * HOUR, 24 * HOUR, WEEK, WEEK];
+    const expected = [5 * MIN, HOUR, 12 * HOUR, CAP, CAP, CAP];
     const logs = [];
 
     // 每一轮：写入「已连续失败 N 次、但冷却刚过期」的状态，重启进程后再触发一次失败，
@@ -216,6 +226,7 @@ test('escalating cooldown ladder end to end', async (t) => {
         keyFailover: true,
         keyStateFile: statePath,
         maxKeyAttempts: 1,
+        keyProbeMs: 0,
       }), 'utf-8');
 
       const port = await freePort();
@@ -242,14 +253,14 @@ test('escalating cooldown ladder end to end', async (t) => {
     assert.match(logs.join(''), /"failures":6/, 'the failure counter must keep accumulating');
   });
 
-  await t.test('quota exhaustion jumps straight to the one-week cap', async () => {
+  await t.test('quota exhaustion jumps straight to the 24h cap', async () => {
     fake.state.rule = { status: 429, message: 'You have exhausted your weekly usage limit. It resets on Monday.' };
     const proxy = await startProxy();
     t.after(() => proxy.stop());
 
     const res = await call(proxy.port);
     assert.equal(res.status, 429);
-    assert.equal(lastCooldownMs(proxy.logs), WEEK, 'first quota failure must cool for a week');
+    assert.equal(lastCooldownMs(proxy.logs), CAP, 'first quota failure must cool for the full cap');
     assert.match(proxy.logs.join(''), /"kind":"quota"/);
   });
 
@@ -280,7 +291,7 @@ test('escalating cooldown ladder end to end', async (t) => {
 
     await call(proxy.port);
     assert.match(proxy.logs.join(''), /Key circuit opened/);
-    assert.equal(lastCooldownMs(proxy.logs), WEEK, 'auth failures are treated as non-self-healing');
+    assert.equal(lastCooldownMs(proxy.logs), CAP, 'auth failures are treated as non-self-healing');
   });
 
   await t.test('a success resets the ladder back to the first rung', async () => {
@@ -462,7 +473,7 @@ test('escalating cooldown ladder end to end', async (t) => {
     assert.equal(res.status, 400);
     assert.equal(fake.state.calls - before, 2, 'a credit-exhausted 400 must try the backup account');
     assert.match(proxy.logs.join(''), /"kind":"quota"/, 'the 400 must be classified as quota');
-    assert.equal(lastCooldownMs(proxy.logs), WEEK, 'quota 400s must jump to the one-week cap');
+    assert.equal(lastCooldownMs(proxy.logs), CAP, 'quota 400s must jump to the cap');
   });
 
   await t.test('a genuine non-credit 400 still does not fail over', async () => {
@@ -497,5 +508,112 @@ test('escalating cooldown ladder end to end', async (t) => {
     const res = await call(proxy.port);
     assert.equal(res.status, 400, 'the upstream quota error must reach the client');
     assert.match(await res.text(), /insufficient credits/);
+  });
+
+  // ── 后台探测：把「半开探针」从用户任务里剥离 ──────────────
+  // 冷却到期的账号不再直接回到候选池，而是等后台探测确认；用户任务只用已确认健康的账号。
+
+  await t.test('a cooldown-expired account is verified in the background, not by a user task', async () => {
+    // KEY_A 额度耗尽、冷却刚到期（=待验证）；KEY_B 健康。
+    // 期望：用户任务完全不碰 KEY_A，只走 KEY_B；后台探测随后去验证 KEY_A。
+    const CREDITS = 'You have insufficient credits to make this request. Please purchase more credits to continue using the service.';
+    fake.state.perKey = { [KEY_A]: { status: 400, message: CREDITS } };
+    fake.state.rule = 'ok';   // KEY_B 保持健康
+    const proxy = await startProxyWithKeys([KEY_A, KEY_B], {
+      dirPrefix: 'cc-probe-',
+      extraConfig: { keyProbeMs: 400 },
+      state: breakerState([
+        [KEY_A, {
+          kind: 'quota', status: 400, until: Date.now() - 1000, failures: 5,
+          message: 'You have insufficient credits to make this request. Please purchase more credits to continue using the service.',
+        }],
+      ]),
+    });
+    t.after(() => proxy.stop());
+
+    const before = fake.state.calls;
+    const res = await call(proxy.port);
+    assert.equal(res.status, 200, 'the healthy account must serve the task');
+    const used = fake.state.authSeen.slice(-(fake.state.calls - before));
+    assert.deepEqual(used, [KEY_B], `a pending-probe account must not be used by a task, saw ${JSON.stringify(used)}`);
+
+    // 后台探测应当接手去验证 KEY_A
+    const deadline = Date.now() + 8000;
+    while (Date.now() < deadline && !/Key probe failed, cooldown renewed/.test(proxy.logs.join(''))) {
+      await new Promise(r => setTimeout(r, 100));
+    }
+    assert.match(proxy.logs.join(''), /Key probe failed, cooldown renewed/, 'the prober must verify the pending account out of band');
+  });
+
+  await t.test('a successful probe returns the account to the pool', async () => {
+    // KEY_A 冷却到期且已恢复（上游返回 200）→ 探测成功后它该回到池子里被使用。
+    fake.state.perKey = {};
+    fake.state.rule = 'ok';
+    const proxy = await startProxyWithKeys([KEY_A, KEY_B], {
+      dirPrefix: 'cc-probe-ok-',
+      extraConfig: { keyProbeMs: 300 },
+      state: breakerState([
+        [KEY_A, { kind: 'quota', status: 400, until: Date.now() - 1000, failures: 5, message: 'You have insufficient credits' }],
+      ]),
+    });
+    t.after(() => proxy.stop());
+
+    const deadline = Date.now() + 8000;
+    while (Date.now() < deadline && !/Key probe succeeded/.test(proxy.logs.join(''))) {
+      await new Promise(r => setTimeout(r, 100));
+    }
+    assert.match(proxy.logs.join(''), /Key probe succeeded, account back in the pool/, 'a recovered account must be promoted');
+
+    // 提升之后，KEY_A（配置里的第一个）应当重新可用
+    const before = fake.state.calls;
+    await call(proxy.port);
+    const used = fake.state.authSeen.slice(-(fake.state.calls - before));
+    assert.ok(used.includes(KEY_A), `the promoted account must be usable again, saw ${JSON.stringify(used)}`);
+  });
+
+  await t.test('disabling the prober restores the old lazy behaviour', async () => {
+    fake.state.perKey = {};
+    // keyProbeMs: 0 → 没有后台任务会来验证，因此冷却到期必须直接视为可用，
+    // 否则账号一旦到期就永远回不到池子。
+    fake.state.rule = 'ok';
+    const proxy = await startProxyWithKeys([KEY_A, KEY_B], {
+      dirPrefix: 'cc-probe-off-',
+      extraConfig: { keyProbeMs: 0 },
+      state: breakerState([
+        [KEY_A, { kind: 'quota', status: 400, until: Date.now() - 1000, failures: 5, message: 'You have insufficient credits' }],
+      ]),
+    });
+    t.after(() => proxy.stop());
+
+    const before = fake.state.calls;
+    const res = await call(proxy.port);
+    assert.equal(res.status, 200);
+    const used = fake.state.authSeen.slice(-(fake.state.calls - before));
+    assert.ok(used.includes(KEY_A), `with the prober off, an expired account stays selectable, saw ${JSON.stringify(used)}`);
+    assert.doesNotMatch(proxy.logs.join(''), /Key prober started/);
+  });
+
+  await t.test('a stale over-long cooldown is clamped to the configured cap', async () => {
+    // 旧版本把额度冷却写成一整周。上限改成 24h 之后，落盘的绝对时间戳不会自动变短，
+    // 必须在加载时钳制，否则「改了配置」要等满一周才生效。
+    fake.state.perKey = {};
+    fake.state.rule = 'ok';
+    const proxy = await startProxyWithKeys([KEY_A, KEY_B], {
+      dirPrefix: 'cc-clamp-',
+      extraConfig: { keyProbeMs: 0 },   // 关掉探测，单看钳制行为
+      state: breakerState([
+        [KEY_A, { kind: 'quota', status: 400, until: Date.now() + 7 * 24 * 3600 * 1000, failures: 5, message: 'You have insufficient credits' }],
+      ]),
+    });
+    t.after(() => proxy.stop());
+
+    await new Promise(r => setTimeout(r, 800));   // 落盘有 250ms 去抖
+    const saved = proxy.readState();
+    const entry = saved.breakers[fingerprint(KEY_A)];
+    const cap = 24 * 3600 * 1000;
+    const remaining = entry.until - Date.now();
+    assert.ok(remaining <= cap + 5000 && remaining > cap - 60000,
+      `a week-long stored cooldown must be clamped to the 24h cap, got ${Math.round(remaining / 3600000)}h`);
+    assert.match(proxy.logs.join(''), /"clampedToCap":1/);
   });
 });

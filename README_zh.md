@@ -209,6 +209,8 @@ refs:
 | `CC_KEY_SHORT_COOLDOWN_MS` | `300000` | 兼容旧配置的阶梯首级 → `keyShortCooldownMs` |
 | `CC_KEY_STATE_FILE` | `<proxy 目录>/.key-health.json` | 熔断状态路径 → `keyStateFile` |
 | `CC_MAX_KEY_ATTEMPTS` | `0`（全部）| 单请求最多尝试几个账号 → `maxKeyAttempts` |
+| `CC_KEY_PROBE_MS` | `60000` | 后台探测间隔；`0` 关闭探测 → `keyProbeMs` |
+| `CC_KEY_PROBE_MODEL` | *(默认)* | 探测使用的模型 → `keyProbeModel` |
 | `CC_CONFIG_LOCAL` | `config.local.json` | 私密覆盖文件路径（已 gitignore）|
 
 开启后，代理会在 Command Code 生成请求以及 fingerprint/lifecycle 初始化请求中附加
@@ -556,7 +558,8 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
 | **Project Slug** | `x-project-slug` = `slugify(DEVICE_PROFILE.projectDir)`，与 `config.workingDir` 同源（默认 `C:\Users\dev\projects\app`，用 `CC_DEVICE_PROJECT_DIR` 改）|
 | **设备档案单一真源** | 指纹 / `config.environment` / `config.workingDir` / `x-project-slug` / lifecycle 的 `os` 共用同一份 `DEVICE_PROFILE`（`win32` / `x64`）—— 不会自相矛盾，也不把宿主真实平台、Node 版本、cwd 交给上游 |
 | **思考强度** | `reasoning_effort` 透传 (off/minimal/low/medium/high/xhigh/max) |
-| **多账号池** | 有序 `apiKeys`，每账号独立熔断，冷却阶梯 5m→1h→12h→24h→1w，额度/鉴权/5xx 自动转移；额度与鉴权类冷却账号不参与故障转移 |
+| **多账号池** | 有序 `apiKeys`，每账号独立熔断，冷却阶梯 5m→1h→12h→24h 封顶，额度/鉴权/5xx 自动转移；额度与鉴权类冷却账号不参与故障转移 |
+| **后台健康探测** | 冷却到期的账号**不会**直接回到池子：它先进入「待验证」状态，由后台定时器发一个最小生成请求（`max_tokens: 1`）确认恢复后才重新接流量。因此用户请求永远不会充当未恢复账号的探针。间隔由 `keyProbeMs` 控制（**0** 关闭探测并退回旧的懒验证行为，此时上限也不再缩短已落盘的冷却）|
 | **API Key 格式验证** | 对 `Authorization: Bearer` 或 `x-api-key` 用正则 `user_[a-zA-Z0-9_-]+` 提取，自动清理多余路径/前缀，`sk-xxx` 等非 `user_` 格式拒 |
 | **流式超时保护** | 流式 30s、非流式 90s → 429 + SDK 自动重试 |
 | **连续超时阈值** | 连续 3 次超时后才提示压缩上下文 |
