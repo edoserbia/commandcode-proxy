@@ -1155,10 +1155,6 @@ function sendJSON(res, status, data) {
   res.end(JSON.stringify(data));
 }
 
-function getApiKey(headers, allowConfigured = false) {
-  return resolveKeyCandidates(headers, allowConfigured).keys[0] || null;
-}
-
 function isLoopbackRequest(req) {
   const address = req.socket?.remoteAddress || '';
   return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
@@ -3773,8 +3769,11 @@ async function handleResponses(req, res) {
     return;
   }
 
-  const apiKey = getApiKey(req.headers);
-  if (!apiKey) {
+  // 与 /v1/chat/completions、/v1/messages 保持一致：走账号池候选解析，
+  // 而不是只取单把密钥 —— 否则 /v1/responses 会绕过熔断与故障转移，
+  // 撞上已额度耗尽的账号时无法自动切换（loopback 免密钥也因此失效）。
+  const keyCandidates = resolveKeyCandidates(req.headers, isLoopbackRequest(req));
+  if (!keyCandidates.keys.length) {
     sendResponsesError(res, 401, 'authentication_error',
       'Missing API key. Send in Authorization: Bearer <key> or x-api-key header');
     return;
@@ -3822,16 +3821,25 @@ async function handleResponses(req, res) {
   });
 
   try {
-    await ensureInitialized(apiKey, abortController.signal);
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, promptCacheKey);
+    // 额度耗尽 / 鉴权失败 / 5xx / 网络错误时自动切换账号重试；此阶段还没有任何
+    // 字节写回客户端，切换对下游透明（与另两个端点同一套策略）。
+    const acquired = await forwardToCCWithFailover({
+      body: ccBody,
+      candidates: keyCandidates.keys,
+      incomingHeaders: req.headers,
+      signal: abortController.signal,
+      promptCacheKey,
+      path: '/v1/responses',
+      model,
+    });
 
-    if (!ccResponse.ok) {
-      const errorText = await ccResponse.text().catch(() => '');
-      const mapped = mapCcError(ccResponse.status, errorText);
-      log('error', 'CC API error', { status: ccResponse.status, path: '/v1/responses', code: mapped.code, body: summarizeUpstreamError(errorText) });
+    if (!acquired.response) {
+      const mapped = acquired.error || { status: 502, body: { error: { message: 'Upstream request failed', type: 'upstream_error' } } };
+      log('error', 'CC API error', { status: mapped.status, path: '/v1/responses', code: mapped.code, body: (mapped.body?.error?.message || '').slice(0, 300) });
       sendResponsesError(res, mapped.status, mapped.body.error.type, mapped.body.error.message, mapped.body.retry_after);
       return;
     }
+    const ccResponse = acquired.response;
 
     if (stream) {
       translator = createResponsesSseTranslator(model, responseId, created);
