@@ -237,6 +237,14 @@ test('escalating cooldown ladder end to end', async (t) => {
       });
       child.stdout.on('data', d => logs.push(d.toString()));
       child.stderr.on('data', d => logs.push(d.toString()));
+      // 必须在断言之前登记清理：否则断言失败会直接跳出循环，这个子进程就永久泄漏
+      // （它会一直占着一个随机端口活到机器重启）。
+      t.after(() => new Promise(r => {
+        if (child.exitCode !== null || child.signalCode !== null) return r();
+        child.once('exit', r);
+        child.kill('SIGKILL');
+        setTimeout(r, 2000);
+      }));
       await waitForHealth(port, child, logs);
 
       const res = await call(port);
